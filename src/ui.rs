@@ -8,19 +8,63 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, List, ListItem, ListState, Paragraph},
 };
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    time::Duration,
+};
 
 #[derive(Default)]
 struct App {
+    keys: crate::keybinds::Keybinds,
+    input: Option<crate::input::Input>,
+    target: Option<(String, Vec<String>, Vec<String>)>,
+    busy: bool,
+    pending_command: bool,
+    follow_working_copy: bool,
+    output: String,
+    listing: Vec<crate::browser::Row>,
+    browse_index: usize,
+    file_filter: String,
+    marked_files: HashSet<String>,
+    revset: String,
+    history: Vec<String>,
+    hit_rows: Vec<(ratatui::layout::Rect, usize, Option<usize>)>,
     snapshot: Option<Snapshot>,
     selection: ListState,
+    graph_selection: ListState,
     files: VecDeque<String>,
     error: Option<String>,
     filter: String,
     searching: bool,
     notice: Option<String>,
+    graph: Vec<crate::graph::GraphRow>,
+    preview: Option<crate::preview::Preview>,
+    requested: Option<String>,
+    preview_error: Option<String>,
+    preview_visible: bool,
+    preview_bottom: bool,
+    preview_focus: bool,
+    view: View,
+    file_index: usize,
+    diff_file: bool,
+    scroll: u16,
+    marked: HashSet<String>,
+}
+
+#[derive(Default, Debug, PartialEq)]
+enum View {
+    #[default]
+    Revisions,
+    Files,
+    Diff,
+    Bookmarks,
+    Help,
+    Operations,
+    Git,
+    Text,
+    Finder,
 }
 
 #[derive(Debug, PartialEq)]
@@ -28,9 +72,54 @@ enum Effect {
     None,
     Quit,
     Refresh,
+    Request(crate::live::Request),
+    External(crate::commands::CommandSpec),
+    Shell(String),
 }
 
 impl App {
+    fn selected_id(&self) -> Option<&str> {
+        self.snapshot
+            .as_ref()?
+            .revisions
+            .get(self.selection.selected()?)
+            .map(|r| r.commit_id.as_str())
+    }
+
+    fn preview_text(&self) -> String {
+        if let Some(error) = &self.preview_error {
+            return format!("Cannot load diff: {error}");
+        }
+        let file = (self.view == View::Files || self.diff_file && self.view == View::Diff)
+            .then_some(self.file_index);
+        let patch = self
+            .preview
+            .as_ref()
+            .map(|p| p.patch(file))
+            .unwrap_or_else(|| "Loading diff…".into());
+        if file.is_none()
+            && let Some(r) = self
+                .snapshot
+                .as_ref()
+                .and_then(|s| self.selection.selected().and_then(|i| s.revisions.get(i)))
+        {
+            format!(
+                "Change {}\nCommit {}\nAuthor {}\nParents {}\n\n{}\n\n{patch}",
+                r.change_id,
+                r.commit_id,
+                r.author,
+                r.parents
+                    .iter()
+                    .map(|id| short(id))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                r.description
+            )
+        } else {
+            patch
+        }
+    }
+
     fn visible(&self) -> Vec<usize> {
         (0..self.snapshot.as_ref().map_or(0, |s| s.revisions.len())).collect()
     }
@@ -71,14 +160,667 @@ impl App {
         }
     }
 
+    fn sources(&self) -> Vec<String> {
+        let Some(snapshot) = &self.snapshot else {
+            return Vec::new();
+        };
+        if !self.marked.is_empty() {
+            return snapshot
+                .revisions
+                .iter()
+                .filter(|r| self.marked.contains(&r.commit_id))
+                .map(|r| r.change_id.clone())
+                .collect();
+        }
+        self.selection
+            .selected()
+            .and_then(|i| snapshot.revisions.get(i))
+            .map(|r| vec![r.change_id.clone()])
+            .unwrap_or_default()
+    }
+    fn action_sources(&self, action: &str) -> Vec<String> {
+        if matches!(
+            action,
+            "new" | "rebase" | "squash" | "abandon" | "duplicate" | "push"
+        ) {
+            return self.sources();
+        }
+        self.snapshot
+            .as_ref()
+            .and_then(|s| self.selection.selected().and_then(|i| s.revisions.get(i)))
+            .map(|r| vec![r.change_id.clone()])
+            .unwrap_or_default()
+    }
+    fn selected_files(&self) -> Vec<String> {
+        if self.view != View::Files {
+            return Vec::new();
+        }
+        if !self.marked_files.is_empty() {
+            return self.marked_files.iter().cloned().collect();
+        }
+        self.preview
+            .as_ref()
+            .and_then(|p| p.files.get(self.file_index))
+            .map(|f| vec![f.path.clone()])
+            .unwrap_or_default()
+    }
+    fn start_input(&mut self, action: &str, label: &str, value: String, confirm: bool) {
+        let mut input =
+            crate::input::Input::new(action, label, value, self.sources(), self.selected_files());
+        input.confirm = confirm;
+        self.input = Some(input);
+        self.error = None;
+        self.notice = None;
+    }
+    fn command_effect(&mut self, spec: crate::commands::CommandSpec) -> Effect {
+        self.history.push(spec.display());
+        if self.history.len() > 100 {
+            self.history.remove(0);
+        }
+        self.target = None;
+        if spec.interactive {
+            Effect::External(spec)
+        } else {
+            self.busy = true;
+            self.pending_command = true;
+            Effect::Request(crate::live::Request::Command(spec))
+        }
+    }
     fn handle_key(&mut self, key: KeyEvent, page_size: usize) -> Effect {
+        if key.kind == KeyEventKind::Release {
+            return Effect::None;
+        }
+        if self.input.is_some() {
+            let action = self.keys.resolve("input", key);
+            if action.as_deref() == Some("cancel") {
+                self.input = None;
+                return Effect::None;
+            }
+            if matches!(action.as_deref(), Some("submit" | "accept")) {
+                let input = self.input.take().unwrap();
+                match input.action.as_str() {
+                    "revset" => {
+                        self.busy = true;
+                        return Effect::Request(crate::live::Request::Revset(input.text));
+                    }
+                    "search" => {
+                        self.filter = input.text;
+                        self.search_match(false, true);
+                        return Effect::None;
+                    }
+                    "file_filter" => {
+                        self.file_filter = input.text;
+                        self.browse_index = 0;
+                        return Effect::None;
+                    }
+                    "shell" => return Effect::Shell(input.text),
+                    _ => match crate::commands::action(
+                        &input.action,
+                        &input.sources,
+                        &input.text,
+                        &input.files,
+                    ) {
+                        Ok(spec) => return self.command_effect(spec),
+                        Err(error) => {
+                            self.error = Some(format!("{error:#}"));
+                            self.input = Some(input);
+                            return Effect::None;
+                        }
+                    },
+                }
+            }
+            let input = self.input.as_mut().unwrap();
+            if !input.confirm {
+                match action.as_deref() {
+                    Some(
+                        "backspace" | "delete" | "cursor_left" | "cursor_right" | "input_home"
+                        | "input_end" | "newline",
+                    ) => input.edit(action.as_deref().unwrap()),
+                    _ => {
+                        if let KeyCode::Char(c) = key.code
+                            && !key.modifiers.intersects(
+                                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                            )
+                        {
+                            input.insert(c);
+                        }
+                    }
+                }
+                if input.action == "search" {
+                    self.filter = input.text.clone();
+                    self.search_match(false, true);
+                } else if input.action == "file_filter" {
+                    self.file_filter = input.text.clone();
+                    self.browse_index = 0;
+                }
+            }
+            return Effect::None;
+        }
+        if self.target.is_some() && self.keys.resolve("input", key).as_deref() == Some("submit") {
+            let (action, sources, files) = self.target.clone().unwrap();
+            if let Some(destination) = self.sources().first() {
+                // Use the cursor, not the marked source set, as the destination.
+                let destination = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| self.selection.selected().and_then(|i| s.revisions.get(i)))
+                    .map(|r| r.change_id.as_str())
+                    .unwrap_or(destination);
+                match crate::commands::action(&action, &sources, destination, &files) {
+                    Ok(spec) => return self.command_effect(spec),
+                    Err(e) => self.error = Some(e.to_string()),
+                }
+            }
+            return Effect::None;
+        }
+        let scope = match self.view {
+            View::Revisions => "revisions",
+            View::Files => "files",
+            View::Bookmarks => "bookmarks",
+            View::Operations => "operations",
+            View::Git => "git",
+            View::Finder => "finder",
+            _ => "view",
+        };
+        let Some(action) = self.keys.resolve(scope, key) else {
+            return Effect::None;
+        };
+        if self.pending_command
+            && matches!(
+                action.as_str(),
+                "new"
+                    | "describe"
+                    | "describe_editor"
+                    | "edit"
+                    | "rebase"
+                    | "squash"
+                    | "abandon"
+                    | "absorb"
+                    | "duplicate"
+                    | "split"
+                    | "diff_edit"
+                    | "commit"
+                    | "restore"
+                    | "set_bookmark"
+                    | "undo"
+                    | "redo"
+                    | "snapshot"
+                    | "fetch"
+                    | "push"
+                    | "remote_add"
+                    | "remote_remove"
+                    | "operation_restore"
+                    | "bookmark_delete"
+                    | "bookmark_track"
+                    | "bookmark_untrack"
+                    | "command"
+                    | "shell"
+            )
+        {
+            self.notice = Some("An action is still running".into());
+            return Effect::None;
+        }
+        if action == "help" {
+            self.view = View::Help;
+            self.scroll = 0;
+            return Effect::None;
+        }
+        if action == "preview" {
+            self.preview_visible = !self.preview_visible;
+            self.preview_focus = false;
+            return Effect::None;
+        }
+        if action == "preview_position" {
+            self.preview_visible = true;
+            self.preview_bottom = !self.preview_bottom;
+            return Effect::None;
+        }
+        if action == "focus" && self.preview_visible {
+            self.preview_focus = !self.preview_focus;
+            return Effect::None;
+        }
+        if self.preview_focus
+            && self.preview_visible
+            && matches!(action.as_str(), "up" | "down" | "page_up" | "page_down")
+        {
+            let amount = if action.starts_with("page_") {
+                page_size as u16
+            } else {
+                1
+            };
+            self.scroll = if action.ends_with("down") {
+                self.scroll.saturating_add(amount)
+            } else {
+                self.scroll.saturating_sub(amount)
+            };
+            return Effect::None;
+        }
+        if self.view == View::Files
+            && self.file_indices().is_empty()
+            && self.marked_files.is_empty()
+            && matches!(
+                action.as_str(),
+                "restore" | "split" | "squash" | "absorb" | "diff" | "select"
+            )
+        {
+            self.notice = Some("No matching files selected".into());
+            return Effect::None;
+        }
+        if self.view == View::Files
+            && matches!(
+                action.as_str(),
+                "down" | "up" | "page_down" | "page_up" | "first" | "last"
+            )
+        {
+            let indices = self.file_indices();
+            if !indices.is_empty() {
+                let current = indices
+                    .iter()
+                    .position(|i| *i == self.file_index)
+                    .unwrap_or(0);
+                let next = match action.as_str() {
+                    "down" => (current + 1).min(indices.len() - 1),
+                    "up" => current.saturating_sub(1),
+                    "page_down" => (current + page_size).min(indices.len() - 1),
+                    "page_up" => current.saturating_sub(page_size),
+                    "last" => indices.len() - 1,
+                    _ => 0,
+                };
+                self.file_index = indices[next];
+                self.scroll = 0;
+            }
+            return Effect::None;
+        }
+        if matches!(self.view, View::Operations | View::Bookmarks | View::Finder) {
+            let count = self.listing_rows().len();
+            match action.as_str() {
+                "down" => {
+                    self.browse_index = (self.browse_index + 1).min(count.saturating_sub(1));
+                    return Effect::None;
+                }
+                "up" => {
+                    self.browse_index = self.browse_index.saturating_sub(1);
+                    return Effect::None;
+                }
+                "page_down" => {
+                    self.browse_index =
+                        (self.browse_index + page_size).min(count.saturating_sub(1));
+                    return Effect::None;
+                }
+                "page_up" => {
+                    self.browse_index = self.browse_index.saturating_sub(page_size);
+                    return Effect::None;
+                }
+                "first" => {
+                    self.browse_index = 0;
+                    return Effect::None;
+                }
+                "last" => {
+                    self.browse_index = count.saturating_sub(1);
+                    return Effect::None;
+                }
+                _ => {}
+            }
+        }
+        match action.as_str() {
+            "search" => {
+                if self.view == View::Files || self.view == View::Finder {
+                    self.start_input(
+                        "file_filter",
+                        "Filter files",
+                        self.file_filter.clone(),
+                        false,
+                    );
+                } else {
+                    self.start_input("search", "Quick search", self.filter.clone(), false);
+                }
+                return Effect::None;
+            }
+            "revset" => {
+                self.start_input("revset", "Revision expression", self.revset.clone(), false);
+                return Effect::None;
+            }
+            "describe" => {
+                let text = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| self.selection.selected().and_then(|i| s.revisions.get(i)))
+                    .map(|r| r.description.clone())
+                    .unwrap_or_default();
+                self.start_input("describe", "Description", text, false);
+                return Effect::None;
+            }
+            "commit" => {
+                self.start_input(
+                    "commit",
+                    "Commit working copy: description",
+                    String::new(),
+                    false,
+                );
+                return Effect::None;
+            }
+            "set_bookmark" => {
+                self.start_input(
+                    &action,
+                    "Set bookmark at selected revision",
+                    String::new(),
+                    false,
+                );
+                return Effect::None;
+            }
+            "rebase" | "squash" => {
+                self.target = Some((action.clone(), self.sources(), self.selected_files()));
+                self.view = View::Revisions;
+                self.notice = Some(format!(
+                    "{action}: choose destination, {} apply, {} cancel",
+                    self.keys.label("input", "submit"),
+                    self.keys.label("global", "cancel")
+                ));
+                return Effect::None;
+            }
+            "abandon" | "restore" | "undo" | "redo" => {
+                self.start_input(
+                    &action,
+                    &format!("Confirm {action} for {} revision(s)", self.sources().len()),
+                    String::new(),
+                    true,
+                );
+                return Effect::None;
+            }
+            "new" | "edit" | "describe_editor" | "diff_edit" | "duplicate" | "absorb"
+            | "snapshot" => {
+                match crate::commands::action(
+                    &action,
+                    &self.action_sources(&action),
+                    "",
+                    &self.selected_files(),
+                ) {
+                    Ok(spec) => return self.command_effect(spec),
+                    Err(e) => self.error = Some(e.to_string()),
+                }
+                return Effect::None;
+            }
+            "split" => {
+                if self.selected_files().is_empty() {
+                    match crate::commands::action("split", &self.sources(), "", &[]) {
+                        Ok(spec) => return self.command_effect(spec),
+                        Err(e) => self.error = Some(e.to_string()),
+                    }
+                } else {
+                    self.start_input("split", "Description for split files", String::new(), false);
+                }
+                return Effect::None;
+            }
+            "operations" => {
+                self.view = View::Operations;
+                self.listing.clear();
+                self.browse_index = 0;
+                self.busy = true;
+                return Effect::Request(crate::live::Request::Listing(
+                    crate::browser::Query::Operations,
+                ));
+            }
+            "bookmarks" => {
+                self.view = View::Bookmarks;
+                self.listing.clear();
+                self.browse_index = 0;
+                self.busy = true;
+                return Effect::Request(crate::live::Request::Listing(
+                    crate::browser::Query::Bookmarks,
+                ));
+            }
+            "file_search" => {
+                if let Some(id) = self.selected_id().map(str::to_owned) {
+                    self.view = View::Finder;
+                    self.listing.clear();
+                    self.file_filter.clear();
+                    self.browse_index = 0;
+                    self.busy = true;
+                    return Effect::Request(crate::live::Request::Listing(
+                        crate::browser::Query::Files(id),
+                    ));
+                }
+                return Effect::None;
+            }
+            "evolution" => {
+                self.view = View::Text;
+                match crate::commands::action(&action, &self.sources(), "", &[]) {
+                    Ok(spec) => return self.command_effect(spec),
+                    Err(e) => self.error = Some(e.to_string()),
+                }
+                return Effect::None;
+            }
+            "git" => {
+                self.view = View::Git;
+                return self.command_effect(crate::commands::CommandSpec::new([
+                    "git",
+                    "remote",
+                    "list",
+                    "--ignore-working-copy",
+                ]));
+            }
+            "fetch" | "push" => {
+                self.start_input(
+                    &action,
+                    if action == "push" {
+                        "Push to remote (publishes bookmarks)"
+                    } else {
+                        "Fetch remote"
+                    },
+                    "origin".into(),
+                    false,
+                );
+                return Effect::None;
+            }
+            "remote_add" => {
+                self.start_input(&action, "Remote name and URL", String::new(), false);
+                return Effect::None;
+            }
+            "remote_remove" => {
+                self.start_input(&action, "Remove remote: name", String::new(), false);
+                return Effect::None;
+            }
+            "operation_restore" | "bookmark_delete" | "bookmark_track" | "bookmark_untrack" => {
+                if let Some(row) = self.listing_rows().get(self.browse_index) {
+                    let value = row.id.clone();
+                    self.start_input(&action, &format!("Confirm {action}: {value}"), value, true);
+                }
+                return Effect::None;
+            }
+            "command" => {
+                self.start_input("command", "jj command (no jj log)", String::new(), false);
+                return Effect::None;
+            }
+            "shell" => {
+                self.start_input("shell", "Shell command", String::new(), false);
+                return Effect::None;
+            }
+            "history" => {
+                self.output = self.history.join("\n");
+                self.view = View::Text;
+                self.scroll = 0;
+                return Effect::None;
+            }
+            "select" if self.view == View::Files => {
+                if let Some(path) = self
+                    .preview
+                    .as_ref()
+                    .and_then(|p| p.files.get(self.file_index))
+                    .map(|f| f.path.clone())
+                    && !self.marked_files.remove(&path)
+                {
+                    self.marked_files.insert(path);
+                }
+                return Effect::None;
+            }
+            "cancel" => {
+                self.target = None;
+                self.marked_files.clear();
+                self.file_filter.clear();
+            }
+            _ => {}
+        }
+        if self.view == View::Finder
+            && action == "open_file"
+            && let Some(row) = self.listing_rows().get(self.browse_index)
+        {
+            let path = format!("root-file:{}", serde_json::to_string(&row.id).unwrap());
+            let source = self.sources().first().cloned().unwrap_or("@".into());
+            self.view = View::Text;
+            return self.command_effect(crate::commands::CommandSpec::new([
+                "file",
+                "show",
+                "-r",
+                &source,
+                "--ignore-working-copy",
+                "--",
+                &path,
+            ]));
+        }
+
+        let legacy = match action.as_str() {
+            "quit" => KeyCode::Char('q'),
+            "cancel" => KeyCode::Esc,
+            "help" => KeyCode::F(1),
+            "down" => KeyCode::Down,
+            "up" => KeyCode::Up,
+            "page_down" => KeyCode::PageDown,
+            "page_up" => KeyCode::PageUp,
+            "first" => KeyCode::Home,
+            "last" => KeyCode::End,
+            "working_copy" => KeyCode::Char('@'),
+            "parent" => KeyCode::Char('J'),
+            "child" => KeyCode::Char('K'),
+            "select" => KeyCode::Char(' '),
+            "next_match" => KeyCode::Char('\''),
+            "previous_match" => KeyCode::Char('"'),
+            "details" => KeyCode::Right,
+            "diff" => KeyCode::Char('d'),
+            "preview" => KeyCode::Char('p'),
+            "preview_position" => KeyCode::Char('P'),
+            "focus" => KeyCode::Tab,
+            "refresh" | "preview_down" | "preview_up" | "preview_page_down" | "preview_page_up" => {
+                let c = match action.as_str() {
+                    "refresh" => 'r',
+                    "preview_down" => 'n',
+                    "preview_up" => 'p',
+                    "preview_page_down" => 'd',
+                    _ => 'u',
+                };
+                return self.handle_navigation(
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+                    page_size,
+                );
+            }
+            _ => return Effect::None,
+        };
+        self.handle_navigation(KeyEvent::new(legacy, KeyModifiers::NONE), page_size)
+    }
+    fn file_indices(&self) -> Vec<usize> {
+        self.preview
+            .as_ref()
+            .map(|p| {
+                p.files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| fuzzy_match(&f.path, &self.file_filter))
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn mouse(&mut self, mouse: event::MouseEvent) {
+        if self.input.is_some() {
+            return;
+        }
+        match mouse.kind {
+            event::MouseEventKind::Down(event::MouseButton::Left) => {
+                if let Some((_, revision, file)) = self
+                    .hit_rows
+                    .iter()
+                    .find(|(rect, _, _)| rect.contains((mouse.column, mouse.row).into()))
+                    .copied()
+                {
+                    self.selection.select(Some(revision));
+                    if let Some(file) = file {
+                        self.view = View::Files;
+                        self.file_index = file;
+                    } else {
+                        self.view = View::Revisions;
+                        if mouse.modifiers.contains(KeyModifiers::CONTROL)
+                            && let Some(id) = self.selected_id().map(str::to_owned)
+                            && !self.marked.remove(&id)
+                        {
+                            self.marked.insert(id);
+                        }
+                    }
+                }
+            }
+            event::MouseEventKind::ScrollDown | event::MouseEventKind::ScrollUp => {
+                let down = mouse.kind == event::MouseEventKind::ScrollDown;
+                if self.view == View::Files {
+                    let indices = self.file_indices();
+                    if !indices.is_empty() {
+                        let i = indices
+                            .iter()
+                            .position(|i| *i == self.file_index)
+                            .unwrap_or(0);
+                        self.file_index = indices[if down {
+                            (i + 1).min(indices.len() - 1)
+                        } else {
+                            i.saturating_sub(1)
+                        }];
+                    }
+                } else {
+                    self.handle_navigation(
+                        KeyEvent::new(
+                            if down { KeyCode::Down } else { KeyCode::Up },
+                            KeyModifiers::NONE,
+                        ),
+                        1,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    fn listing_rows(&self) -> Vec<&crate::browser::Row> {
+        self.listing
+            .iter()
+            .filter(|row| self.view != View::Finder || fuzzy_match(&row.label, &self.file_filter))
+            .collect()
+    }
+    fn handle_navigation(&mut self, key: KeyEvent, page_size: usize) -> Effect {
         if key.kind == KeyEventKind::Release {
             return Effect::None;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('c') => Effect::Quit,
-                KeyCode::Char('r') if !self.searching => Effect::Refresh,
+                KeyCode::Char('r') if !self.searching => {
+                    self.requested = None;
+                    Effect::Refresh
+                }
+                KeyCode::Char('n' | 'd') if !self.searching && self.preview_visible => {
+                    self.scroll = self
+                        .scroll
+                        .saturating_add(if key.code == KeyCode::Char('d') {
+                            page_size as u16
+                        } else {
+                            1
+                        });
+                    Effect::None
+                }
+                KeyCode::Char('p' | 'u') if !self.searching && self.preview_visible => {
+                    self.scroll = self
+                        .scroll
+                        .saturating_sub(if key.code == KeyCode::Char('u') {
+                            page_size as u16
+                        } else {
+                            1
+                        });
+                    Effect::None
+                }
                 _ => Effect::None,
             };
         }
@@ -112,7 +854,105 @@ impl App {
             }
             code => code,
         };
+        if self.view != View::Revisions {
+            if matches!(code, KeyCode::Esc | KeyCode::Left | KeyCode::Char('h')) {
+                self.view = if self.view == View::Diff && self.diff_file {
+                    View::Files
+                } else {
+                    View::Revisions
+                };
+                self.scroll = 0;
+                return Effect::None;
+            }
+            if matches!(code, KeyCode::Char('q')) {
+                return Effect::Quit;
+            }
+            if self.view == View::Files {
+                let old_index = self.file_index;
+                let len = self.preview.as_ref().map_or(0, |p| p.files.len());
+                match code {
+                    KeyCode::Down | KeyCode::Char('j') if len > 0 => {
+                        self.file_index = (self.file_index + 1).min(len - 1)
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.file_index = self.file_index.saturating_sub(1)
+                    }
+                    KeyCode::PageDown if len > 0 => {
+                        self.file_index = (self.file_index + page_size).min(len - 1)
+                    }
+                    KeyCode::PageUp => self.file_index = self.file_index.saturating_sub(page_size),
+                    KeyCode::Char('d') => {
+                        self.view = View::Diff;
+                        self.diff_file = true;
+                        self.scroll = 0;
+                    }
+                    KeyCode::Char('p') => self.preview_visible = !self.preview_visible,
+                    _ => {}
+                }
+                if old_index != self.file_index {
+                    self.scroll = 0;
+                }
+                return Effect::None;
+            }
+            match code {
+                KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_add(1),
+                KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
+                KeyCode::PageDown => self.scroll = self.scroll.saturating_add(page_size as u16),
+                KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(page_size as u16),
+                KeyCode::Home => self.scroll = 0,
+                KeyCode::End => self.scroll = u16::MAX,
+                _ => {}
+            }
+            return Effect::None;
+        }
+        if self.preview_focus {
+            match code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.scroll = self.scroll.saturating_add(1);
+                    return Effect::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.scroll = self.scroll.saturating_sub(1);
+                    return Effect::None;
+                }
+                _ => {}
+            }
+        }
         match code {
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.view = View::Files;
+                self.file_index = 0;
+                self.scroll = 0;
+            }
+            KeyCode::Char('d') => {
+                self.view = View::Diff;
+                self.diff_file = false;
+                self.scroll = 0;
+            }
+            KeyCode::Char('p') => {
+                self.preview_visible = !self.preview_visible;
+                self.preview_focus = false;
+            }
+            KeyCode::Char('P') => {
+                self.preview_visible = true;
+                self.preview_bottom = !self.preview_bottom;
+            }
+            KeyCode::Tab if self.preview_visible => self.preview_focus = !self.preview_focus,
+            KeyCode::Char('b') => {
+                self.view = View::Bookmarks;
+                self.scroll = 0;
+            }
+            KeyCode::Char('?') | KeyCode::F(1) => {
+                self.view = View::Help;
+                self.scroll = 0;
+            }
+            KeyCode::Char(' ') => {
+                if let Some(id) = self.selected_id().map(str::to_owned)
+                    && !self.marked.remove(&id)
+                {
+                    self.marked.insert(id);
+                }
+            }
             KeyCode::Char('q') => return Effect::Quit,
             KeyCode::Char('/') => {
                 self.searching = true;
@@ -123,6 +963,8 @@ impl App {
             KeyCode::Esc => {
                 self.filter.clear();
                 self.notice = None;
+                self.marked.clear();
+                self.preview_focus = false;
             }
             KeyCode::Char('j') | KeyCode::Down if len > 0 => {
                 self.selection.select(Some((current + 1).min(len - 1)))
@@ -149,13 +991,6 @@ impl App {
                     self.selection.select(Some(index));
                 }
             }
-            KeyCode::Char('r') => {
-                self.notice = Some("Rebase (r) is not implemented yet. Ctrl-R refreshes.".into())
-            }
-            KeyCode::Char('g') => {
-                self.notice =
-                    Some("Git view (g) is not implemented yet. Home/End jump to first/last.".into())
-            }
             _ => {}
         }
         Effect::None
@@ -169,6 +1004,9 @@ impl App {
             .and_then(|i| visible.get(i))
             .and_then(|i| self.snapshot.as_ref().map(|s| &s.revisions[*i]))
             .map(|r| (r.commit_id.clone(), r.change_id.clone()));
+        self.graph = crate::graph::render(&snapshot.revisions);
+        self.marked
+            .retain(|id| snapshot.revisions.iter().any(|r| &r.commit_id == id));
         self.snapshot = Some(snapshot);
         let visible = self.visible();
         let revisions = &self.snapshot.as_ref().unwrap().revisions;
@@ -186,22 +1024,130 @@ impl App {
             })
             .or_else(|| visible.iter().position(|i| revisions[*i].working_copy))
             .unwrap_or(0);
+        let selected = if self.follow_working_copy {
+            self.follow_working_copy = false;
+            visible
+                .iter()
+                .position(|i| revisions[*i].working_copy)
+                .unwrap_or(selected)
+        } else {
+            selected
+        };
         self.selection
             .select((!visible.is_empty()).then_some(selected));
         self.error = None;
+        if self
+            .preview
+            .as_ref()
+            .is_some_and(|p| Some(p.commit_id.as_str()) != self.selected_id())
+        {
+            self.preview = None;
+        }
     }
 }
 
-pub fn run(live: Live) -> Result<()> {
+pub fn run(live: Live, keys: crate::keybinds::Keybinds) -> Result<()> {
     let mut terminal = ratatui::init();
+    crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
+    let _mouse = MouseCapture;
+
     // ratatui also installs a panic hook to restore the terminal.
     let result = (|| -> Result<()> {
-        let mut app = App::default();
+        let mut app = App {
+            keys,
+            revset: live.initial_revset.clone(),
+            ..App::default()
+        };
         loop {
             for update in live.updates.try_iter() {
                 match update {
-                    Update::Repository(snapshot) => app.update(snapshot),
-                    Update::Error(error) => app.error = Some(error),
+                    Update::Repository(snapshot) => {
+                        app.update(snapshot);
+                        if !app.busy {
+                            let query = match app.view {
+                                View::Bookmarks => Some(crate::browser::Query::Bookmarks),
+                                View::Operations => Some(crate::browser::Query::Operations),
+                                View::Finder => app
+                                    .selected_id()
+                                    .map(|id| crate::browser::Query::Files(id.into())),
+                                _ => None,
+                            };
+                            if let Some(query) = query {
+                                app.busy = live
+                                    .tasks
+                                    .try_send(crate::live::Request::Listing(query))
+                                    .is_ok();
+                            }
+                        }
+                    }
+                    Update::Error(error) => {
+                        app.error = Some(error);
+                        app.busy = false;
+                    }
+                    Update::RevsetApplied(expression) => {
+                        app.revset = expression;
+                        app.busy = false;
+                    }
+                    Update::Listing(result) => {
+                        app.busy = false;
+                        match result {
+                            Ok(list) => {
+                                let expected = match &list.query {
+                                    crate::browser::Query::Bookmarks => app.view == View::Bookmarks,
+                                    crate::browser::Query::Operations => {
+                                        app.view == View::Operations
+                                    }
+                                    crate::browser::Query::Files(id) => {
+                                        app.view == View::Finder && app.selected_id() == Some(id)
+                                    }
+                                };
+                                if !expected {
+                                    continue;
+                                }
+                                app.notice = None;
+                                let selected = app
+                                    .listing_rows()
+                                    .get(app.browse_index)
+                                    .map(|r| r.id.clone());
+                                app.listing = list.rows;
+                                app.browse_index = selected
+                                    .and_then(|id| {
+                                        app.listing_rows().iter().position(|r| r.id == id)
+                                    })
+                                    .unwrap_or(0);
+                            }
+                            Err(error) => app.error = Some(error),
+                        }
+                    }
+                    Update::CommandFinished { command, result } => {
+                        app.busy = false;
+                        app.pending_command = false;
+                        match result {
+                            Ok(output) => {
+                                app.output = output;
+                                app.follow_working_copy = ["jj new", "jj edit", "jj commit"]
+                                    .iter()
+                                    .any(|prefix| command.starts_with(prefix));
+                                app.notice = Some(format!("{command} completed"));
+                                app.error = None;
+                            }
+                            Err(error) => {
+                                app.error = Some(error);
+                            }
+                        }
+                        app.requested = None;
+                    }
+                    Update::Preview { id, result } => {
+                        if app.selected_id() == Some(&id) {
+                            match result {
+                                Ok(preview) => {
+                                    app.preview = Some(preview);
+                                    app.preview_error = None;
+                                }
+                                Err(error) => app.preview_error = Some(error),
+                            }
+                        }
+                    }
                     Update::Files(paths) => {
                         for path in paths {
                             app.files.retain(|p| p != &path);
@@ -211,57 +1157,80 @@ pub fn run(live: Live) -> Result<()> {
                     }
                 }
             }
-            terminal.draw(|frame| {
-                let [header, body, footer] = Layout::vertical([
-                    Constraint::Length(2), Constraint::Min(4), Constraint::Length(2),
-                ]).areas(frame.area());
-                let op = app.snapshot.as_ref().map(|s| short(&s.operation)).unwrap_or("loading");
-                frame.render_widget(Paragraph::new(Line::from(vec![
-                    Span::styled(" jjui-rs ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw(format!("  LIVE · jj-lib · op {op}")),
-                ])), header);
-                let [history, side] = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(body);
-                let [details, files] = Layout::vertical([Constraint::Percentage(65), Constraint::Percentage(35)]).areas(side);
-                let visible = app.visible();
-                let matches: Vec<_> = visible.iter().map(|i| app.matches(*i)).collect();
-                let items: Vec<_> = visible.iter().map(|i| {
-                    let r = &app.snapshot.as_ref().unwrap().revisions[*i];
-                    let description = r.description.lines().next().filter(|s| !s.is_empty()).unwrap_or("(no description)");
-                    ListItem::new(vec![Line::from(vec![
-                        Span::styled(if r.working_copy { "@ " } else { "○ " }, Style::default().fg(Color::Green)),
-                        Span::styled(short(&r.change_id), Style::default().fg(Color::Magenta)),
-                        Span::raw(format!("  {} ", short(&r.commit_id))),
-                        Span::styled(r.bookmarks.join(" "), Style::default().fg(Color::Cyan)),
-                    ]), Line::raw(format!("  {description}"))]).style(if matches[*i] { Style::default().fg(Color::Yellow) } else { Style::default() })
-                }).collect();
-                frame.render_stateful_widget(List::new(items)
-                    .block(Block::bordered().title(format!(" Revisions · {} · /{} ", visible.len(), app.filter)))
-                    .highlight_style(Style::default().bg(Color::DarkGray)).highlight_symbol("▸ "), history, &mut app.selection);
-                let selected = app.selection.selected().and_then(|i| visible.get(i))
-                    .map(|i| &app.snapshot.as_ref().unwrap().revisions[*i]);
-                let text = selected.map(|r| format!("Change  {}\nCommit  {}\nAuthor  {}\nParents {}\nBookmarks {}\n\n{}",
-                    r.change_id, r.commit_id, r.author, r.parents.iter().map(|s| short(s)).collect::<Vec<_>>().join(", "),
-                    r.bookmarks.join(", "), r.description)).unwrap_or_else(|| "No matching revisions".into());
-                frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }).block(Block::bordered().title(" Revision details ")), details);
-                let paths = if app.files.is_empty() { "Waiting for file edits…".into() } else { app.files.iter().cloned().collect::<Vec<_>>().join("\n") };
-                frame.render_widget(Paragraph::new(paths).block(Block::bordered().title(" Recent file events · not snapshotted ")), files);
-                let help = if let Some(error) = &app.error { error.clone() }
-                    else if let Some(notice) = &app.notice { notice.clone() }
-                    else if app.searching { format!("Search: /{}  · Enter accept · Esc clear", app.filter) }
-                    else { "j/k move · PgUp/PgDn page · @ working copy · J/K parent/child · Ctrl-R refresh · q quit\n/ search · apostrophe/quote next/previous match · Esc clear · Home/End first/last".into() };
-                frame.render_widget(Paragraph::new(help).style(Style::default().fg(if app.error.is_some() { Color::Red } else { Color::Gray })), footer);
-            })?;
+            if (app.preview_visible || matches!(app.view, View::Files | View::Diff))
+                && let Some(id) = app.selected_id().map(str::to_owned)
+                && app.requested.as_ref() != Some(&id)
+            {
+                app.preview = None;
+                app.preview_error = None;
+                app.marked_files.clear();
+                app.scroll = 0;
+                app.file_index = 0;
+                if live.preview.try_send(id.clone()).is_ok() {
+                    app.requested = Some(id);
+                }
+            }
+            terminal.draw(|frame| draw(frame, &mut app))?;
             if !event::poll(Duration::from_millis(100))? {
                 continue;
             }
-            let Event::Key(key) = event::read()? else {
-                continue;
+            let key = match event::read()? {
+                Event::Key(key) => key,
+                Event::Mouse(mouse) => {
+                    app.mouse(mouse);
+                    continue;
+                }
+                _ => continue,
             };
             let page_size = terminal.size()?.height.saturating_sub(6) as usize / 2;
             match app.handle_key(key, page_size) {
                 Effect::Quit => break,
                 Effect::Refresh => {
                     let _ = live.refresh.try_send(());
+                }
+                Effect::Request(request) => {
+                    if let Err(error) = live.tasks.try_send(request) {
+                        app.busy = false;
+                        app.pending_command = false;
+                        app.error = Some(error.to_string());
+                    }
+                }
+                Effect::External(spec) => {
+                    crossterm::execute!(std::io::stdout(), event::DisableMouseCapture)?;
+                    ratatui::restore();
+                    let result = spec
+                        .process(&live.root)
+                        .and_then(|mut command| Ok(command.status()?));
+                    terminal = ratatui::init();
+                    crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
+                    terminal.clear()?;
+                    match result {
+                        Ok(status) if status.success() => {
+                            app.notice = Some(format!("{} completed", spec.display()))
+                        }
+                        Ok(status) => {
+                            app.error = Some(format!("{} failed: {status}", spec.display()))
+                        }
+                        Err(error) => app.error = Some(error.to_string()),
+                    }
+                    let _ = live.refresh.try_send(());
+                    app.requested = None;
+                }
+                Effect::Shell(command) => {
+                    crossterm::execute!(std::io::stdout(), event::DisableMouseCapture)?;
+                    ratatui::restore();
+                    let status = std::process::Command::new(
+                        std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()),
+                    )
+                    .args(["-c", &command])
+                    .current_dir(&live.root)
+                    .status();
+                    terminal = ratatui::init();
+                    crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
+                    terminal.clear()?;
+                    app.notice = Some(format!("Shell: {status:?}"));
+                    let _ = live.refresh.try_send(());
+                    app.requested = None;
                 }
                 Effect::None => {}
             }
@@ -270,6 +1239,392 @@ pub fn run(live: Live) -> Result<()> {
     })();
     ratatui::restore();
     result
+}
+
+struct MouseCapture;
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), event::DisableMouseCapture);
+    }
+}
+
+fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    app.hit_rows.clear();
+    draw_body(frame, app);
+    if let Some(input) = &app.input {
+        let area = frame.area();
+        let height = area.height.min(9);
+        let area =
+            ratatui::layout::Rect::new(area.x, area.y + area.height - height, area.width, height);
+        frame.render_widget(ratatui::widgets::Clear, area);
+        let text = if input.confirm {
+            format!(
+                "{}\nSources: {}\nFiles: {}",
+                input.text,
+                input.sources.join(", "),
+                input.files.join(", ")
+            )
+        } else {
+            input.visible()
+        };
+        let text = format!(
+            "{text}\n{} apply · {} cancel · {} newline",
+            app.keys.label("input", "submit"),
+            app.keys.label("input", "cancel"),
+            app.keys.label("input", "newline")
+        );
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(Block::bordered().title(input.label.clone())),
+            area,
+        );
+    }
+}
+
+fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .areas(frame.area());
+    let operation = app
+        .snapshot
+        .as_ref()
+        .map(|s| short(&s.operation))
+        .unwrap_or("loading");
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " jjui-rs ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "  LIVE · op {operation} · {} selected · {} recent file events",
+                app.marked.len(),
+                app.files.len()
+            )),
+        ])),
+        header,
+    );
+    let footer_text = app
+        .error
+        .as_deref()
+        .or(app.notice.as_deref())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "{} move · {} files · {} diff · {} preview · {} help · {} quit\n{} · revset: {}",
+                app.keys.label("revisions", "down"),
+                app.keys.label("revisions", "details"),
+                app.keys.label("revisions", "diff"),
+                app.keys.label("revisions", "preview"),
+                app.keys.label("global", "help"),
+                app.keys.label("global", "quit"),
+                if app.busy {
+                    "Action running…"
+                } else {
+                    "LIVE"
+                },
+                app.revset
+            )
+        });
+    frame.render_widget(
+        Paragraph::new(footer_text).style(Style::default().fg(if app.error.is_some() {
+            Color::Red
+        } else {
+            Color::Gray
+        })),
+        footer,
+    );
+    if matches!(app.view, View::Bookmarks | View::Operations | View::Finder) {
+        let rows = app.listing_rows();
+        let items: Vec<_> = rows
+            .iter()
+            .map(|row| ListItem::new(row.label.clone()))
+            .collect();
+        let mut state = ListState::default();
+        if !items.is_empty() {
+            state.select(Some(app.browse_index.min(items.len() - 1)));
+        }
+        let title = match app.view {
+            View::Operations => " Operations (latest 200) ".to_owned(),
+            View::Bookmarks => " Local / remote bookmarks ".to_owned(),
+            _ => format!(
+                " File finder · {} filter · {} open ",
+                app.keys.label("finder", "search"),
+                app.keys.label("finder", "open_file")
+            ),
+        };
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(Block::bordered().title(title))
+                .highlight_style(Style::default().bg(Color::DarkGray))
+                .highlight_symbol("▸ "),
+            body,
+            &mut state,
+        );
+        return;
+    }
+    if matches!(app.view, View::Diff | View::Help | View::Text | View::Git) {
+        let (title, text) = match app.view {
+            View::Diff => (" Diff ", app.preview_text()),
+            View::Help => (
+                " Key bindings ",
+                format!(
+                    "{}\n\nRecent working-tree events\n{}",
+                    app.keys.help(),
+                    app.files.iter().cloned().collect::<Vec<_>>().join("\n")
+                ),
+            ),
+            View::Git => (
+                " Git remotes ",
+                format!(
+                    "{} fetch · {} push · {} add remote · {} remove remote\n\n{}",
+                    app.keys.label("git", "fetch"),
+                    app.keys.label("git", "push"),
+                    app.keys.label("git", "remote_add"),
+                    app.keys.label("git", "remote_remove"),
+                    app.output
+                ),
+            ),
+            _ => (" Command output / history ", app.output.clone()),
+        };
+        draw_text(
+            frame,
+            body,
+            title,
+            &text,
+            &mut app.scroll,
+            app.view == View::Diff,
+        );
+        return;
+    }
+    let (main, preview_area) = if app.preview_visible {
+        let areas = if app.preview_bottom {
+            Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(body)
+        } else {
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(body)
+        };
+        (areas[0], Some(areas[1]))
+    } else {
+        (body, None)
+    };
+    draw_graph(frame, main, app);
+    if let Some(area) = preview_area {
+        let text = app.preview_text();
+        draw_text(
+            frame,
+            area,
+            if app.preview_focus {
+                " Diff preview · focused "
+            } else {
+                " Diff preview "
+            },
+            &text,
+            &mut app.scroll,
+            true,
+        );
+    }
+}
+
+fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let mut items = Vec::new();
+    let mut selected_row = None;
+    let mut targets = Vec::new();
+    if let Some(snapshot) = &app.snapshot {
+        for (i, revision) in snapshot.revisions.iter().enumerate() {
+            let graph = &app.graph[i];
+            let selected = app.selection.selected() == Some(i);
+            let style = if app.matches(i) {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            if selected {
+                selected_row = Some(items.len());
+            }
+            targets.push((i, None));
+            items.push(
+                ListItem::new(Line::from(vec![
+                    Span::styled(graph.node.clone(), Style::default().fg(Color::Green)),
+                    Span::styled(
+                        short(&revision.change_id).to_owned(),
+                        Style::default().fg(Color::Magenta),
+                    ),
+                    Span::raw(format!(
+                        " {}{} ",
+                        short(&revision.commit_id),
+                        if app.marked.contains(&revision.commit_id) {
+                            " [selected]"
+                        } else {
+                            ""
+                        }
+                    )),
+                    Span::styled(
+                        revision.bookmarks.join(" "),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]))
+                .style(style),
+            );
+            let description = revision
+                .description
+                .lines()
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("(no description)");
+            targets.push((i, None));
+            items.push(
+                ListItem::new(Line::from(vec![
+                    Span::styled(graph.edge.clone(), Style::default().fg(Color::Green)),
+                    Span::raw(description.to_owned()),
+                ]))
+                .style(style),
+            );
+            if selected && app.view == View::Files {
+                let inline = |text: String| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            graph.continuation.clone(),
+                            Style::default().fg(Color::Green),
+                        ),
+                        Span::raw(format!("  {text}")),
+                    ]))
+                };
+                let title = if let Some(error) = &app.preview_error {
+                    format!("Files · {error}")
+                } else if let Some(preview) = &app.preview {
+                    format!(
+                        "Files · {}{}",
+                        preview.files.len(),
+                        if preview.truncated {
+                            " (truncated)"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    "Files · loading…".into()
+                };
+                selected_row = Some(items.len());
+                targets.push((i, None));
+                items.push(inline(title));
+                if let Some(preview) = &app.preview {
+                    if preview.files.is_empty() {
+                        targets.push((i, None));
+                        items.push(inline("(no file changes)".into()));
+                    }
+                    app.file_index = app.file_index.min(preview.files.len().saturating_sub(1));
+                    for (index, file) in preview.files.iter().enumerate() {
+                        if !fuzzy_match(&file.path, &app.file_filter) {
+                            continue;
+                        }
+                        if index == app.file_index {
+                            selected_row = Some(items.len());
+                        }
+                        targets.push((i, Some(index)));
+                        items.push(inline(format!(
+                            "{}  {}{}",
+                            file.status,
+                            file.path,
+                            if app.marked_files.contains(&file.path) {
+                                " [selected]"
+                            } else {
+                                ""
+                            }
+                        )));
+                    }
+                }
+            }
+            if let Some(boundary) = &graph.boundary {
+                targets.push((i, None));
+                items.push(ListItem::new(format!(
+                    "{boundary} ancestors outside loaded history"
+                )));
+            }
+        }
+    }
+    app.graph_selection.select(selected_row);
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(Block::bordered().title(format!(" Revisions · /{} ", app.filter)))
+            .highlight_style(Style::default().bg(Color::DarkGray))
+            .highlight_symbol("▸ "),
+        area,
+        &mut app.graph_selection,
+    );
+    for (row, (revision, file)) in targets
+        .into_iter()
+        .skip(app.graph_selection.offset())
+        .take(area.height.saturating_sub(2) as usize)
+        .enumerate()
+    {
+        app.hit_rows.push((
+            ratatui::layout::Rect::new(
+                area.x + 1,
+                area.y + 1 + row as u16,
+                area.width.saturating_sub(2),
+                1,
+            ),
+            revision,
+            file,
+        ));
+    }
+}
+
+fn draw_text(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    title: &str,
+    text: &str,
+    scroll: &mut u16,
+    diff: bool,
+) {
+    let count = text.lines().count();
+    *scroll = (*scroll as usize)
+        .min(count.saturating_sub(area.height.saturating_sub(2) as usize))
+        .min(u16::MAX as usize) as u16;
+    let lines: Vec<_> = text
+        .lines()
+        .map(|line| {
+            Line::styled(
+                line.to_owned(),
+                Style::default().fg(if diff {
+                    if line.starts_with('+') {
+                        Color::Green
+                    } else if line.starts_with('-') {
+                        Color::Red
+                    } else if line.starts_with("@@") {
+                        Color::Cyan
+                    } else {
+                        Color::Reset
+                    }
+                } else {
+                    Color::Reset
+                }),
+            )
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((*scroll, 0))
+            .block(Block::bordered().title(title)),
+        area,
+    );
+}
+
+fn fuzzy_match(value: &str, query: &str) -> bool {
+    let value = value.to_lowercase();
+    let mut chars = value.chars();
+    query
+        .to_lowercase()
+        .chars()
+        .all(|needle| chars.by_ref().any(|c| c == needle))
 }
 
 fn short(value: &str) -> &str {
@@ -347,8 +1702,13 @@ mod tests {
         assert_eq!(app.selection.selected(), Some(0));
         press(&mut app, KeyCode::PageDown);
         assert_eq!(app.selection.selected(), Some(2));
-        press(&mut app, KeyCode::Char('g'));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('g')),
+            Effect::Request(_)
+        ));
         assert_eq!(app.selection.selected(), Some(2));
+        app.busy = false;
+        press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Char('@'));
         assert_eq!(app.selection.selected(), Some(0));
         assert_eq!(press(&mut app, KeyCode::Char('r')), Effect::None);
@@ -396,5 +1756,223 @@ mod tests {
             press(&mut app, code);
         }
         assert_eq!(app.selection.selected(), None);
+    }
+    #[test]
+    fn details_diff_preview_and_selection_bindings() {
+        let mut app = key_fixture();
+        app.preview = Some(crate::preview::Preview {
+            commit_id: "child".into(),
+            truncated: false,
+            files: vec![crate::preview::FileDiff {
+                path: "file".into(),
+                status: "A".into(),
+                patch: String::new(),
+            }],
+        });
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.marked.contains("child"));
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.preview_visible);
+        press(&mut app, KeyCode::Char('P'));
+        assert!(app.preview_bottom);
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(app.view, View::Files);
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.view, View::Diff);
+        assert!(app.diff_file);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::Files);
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.view, View::Revisions);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.marked.is_empty());
+        press(&mut app, KeyCode::Char('d'));
+        assert!(!app.diff_file);
+    }
+
+    #[test]
+    fn graph_and_diff_render_in_small_and_normal_terminals() {
+        let mut app = key_fixture();
+        app.preview = Some(crate::preview::Preview {
+            commit_id: "child".into(),
+            truncated: false,
+            files: vec![crate::preview::FileDiff {
+                path: "file.txt".into(),
+                status: "M".into(),
+                patch: "-old\n+new\n".into(),
+            }],
+        });
+        for (width, height) in [(120, 35), (20, 5), (1, 1)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            for view in [
+                View::Revisions,
+                View::Files,
+                View::Diff,
+                View::Help,
+                View::Bookmarks,
+            ] {
+                app.view = view;
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            }
+        }
+    }
+    fn rendered_rows(app: &mut App, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(120)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn expanded_files_push_graph_down_and_preserve_edges() {
+        let mut app = key_fixture();
+        app.preview = Some(crate::preview::Preview {
+            commit_id: "child".into(),
+            truncated: false,
+            files: vec![crate::preview::FileDiff {
+                path: "changed.txt".into(),
+                status: "M".into(),
+                patch: "patch".into(),
+            }],
+        });
+        let before = rendered_rows(&mut app, 30);
+        let parent_before = before
+            .iter()
+            .position(|line| line.contains("other parent"))
+            .unwrap();
+        press(&mut app, KeyCode::Char('l'));
+        let expanded = rendered_rows(&mut app, 30);
+        let file_row = expanded
+            .iter()
+            .position(|line| line.contains("changed.txt"))
+            .unwrap();
+        let parent_after = expanded
+            .iter()
+            .position(|line| line.contains("other parent"))
+            .unwrap();
+        let child_row = expanded
+            .iter()
+            .position(|line| line.contains("match-one child"))
+            .unwrap();
+        assert!(child_row < file_row && file_row < parent_after);
+        assert_eq!(parent_after, parent_before + 2);
+        assert!(expanded[file_row].contains("│   M  changed.txt"));
+        assert!(expanded[file_row].contains('▸'));
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::Files);
+        assert!(
+            rendered_rows(&mut app, 30)
+                .iter()
+                .any(|line| line.contains("changed.txt"))
+        );
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(rendered_rows(&mut app, 30), before);
+        assert_eq!(app.selection.selected(), Some(0));
+    }
+
+    #[test]
+    fn long_inline_file_list_scrolls_to_selected_file_and_collapses() {
+        let mut app = key_fixture();
+        app.preview = Some(crate::preview::Preview {
+            commit_id: "child".into(),
+            truncated: false,
+            files: (0..40)
+                .map(|i| crate::preview::FileDiff {
+                    path: format!("file-{i:02}.txt"),
+                    status: "A".into(),
+                    patch: String::new(),
+                })
+                .collect(),
+        });
+        press(&mut app, KeyCode::Right);
+        for _ in 0..39 {
+            press(&mut app, KeyCode::Down);
+        }
+        assert!(
+            rendered_rows(&mut app, 12)
+                .iter()
+                .any(|line| line.contains("file-39.txt") && line.contains('▸'))
+        );
+        press(&mut app, KeyCode::Left);
+        let collapsed = rendered_rows(&mut app, 12);
+        assert!(
+            collapsed
+                .iter()
+                .any(|line| line.contains("match-one child") && line.contains('▸'))
+        );
+        assert!(!collapsed.iter().any(|line| line.contains("file-")));
+    }
+    #[test]
+    fn custom_bindings_drive_dispatch_and_input_target_submission() {
+        let mut app = key_fixture();
+        app.keys
+            .merge("[revisions]\ndown=['ctrl+j']\nnew=[]\n[input]\nsubmit=['ctrl+enter']\n")
+            .unwrap();
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.selection.selected(), Some(0));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL), 2);
+        assert_eq!(app.selection.selected(), Some(1));
+        assert_eq!(press(&mut app, KeyCode::Char('n')), Effect::None);
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.target.is_some());
+        press(&mut app, KeyCode::Home);
+        let effect = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), 2);
+        let Effect::Request(crate::live::Request::Command(spec)) = effect else {
+            panic!("expected rebase")
+        };
+        assert_eq!(spec.args, vec!["rebase", "-r", "other", "-o", "match-one"]);
+    }
+    #[test]
+    fn input_characters_do_not_trigger_actions_and_cancel_has_no_mutation() {
+        let mut app = key_fixture();
+        press(&mut app, KeyCode::Enter);
+        for c in "qnr😀".chars() {
+            assert_eq!(press(&mut app, KeyCode::Char(c)), Effect::None);
+        }
+        assert_eq!(app.input.as_ref().unwrap().text, "qnr😀");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.input.is_none());
+        assert!(!app.busy);
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.input.as_ref().unwrap().confirm);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.busy);
+    }
+    #[test]
+    fn mouse_targets_follow_inline_files_and_graph_scroll() {
+        let mut app = key_fixture();
+        rendered_rows(&mut app, 30);
+        let (rect, _, _) = app
+            .hit_rows
+            .iter()
+            .find(|(_, i, _)| *i == 1)
+            .copied()
+            .unwrap();
+        app.mouse(event::MouseEvent {
+            kind: event::MouseEventKind::Down(event::MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.selection.selected(), Some(1));
+    }
+    #[test]
+    fn empty_file_filter_cannot_trigger_whole_revision_restore() {
+        let mut app = key_fixture();
+        app.view = View::Files;
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.input.is_none());
+        assert!(!app.pending_command);
+        assert!(app.notice.as_ref().unwrap().contains("No matching files"));
+        press(&mut app, KeyCode::F(1));
+        assert_eq!(app.view, View::Help);
     }
 }

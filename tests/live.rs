@@ -53,7 +53,11 @@ struct Watch {
 }
 impl Watch {
     fn new(root: &Path) -> Self {
+        Self::with_options(root, &[])
+    }
+    fn with_options(root: &Path, options: &[&str]) -> Self {
         let mut child = viewer(root)
+            .args(options)
             .arg("--watch-json")
             .stdout(Stdio::piped())
             .spawn()
@@ -190,4 +194,270 @@ fn divergent_operations_are_reported_without_reconciliation() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("operation heads"));
     assert_eq!(heads(temp.path()), divergent);
+}
+
+fn snapshot(root: &Path) -> Value {
+    let output = viewer(root).arg("--once").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+fn diff(root: &Path, id: &str) -> Value {
+    let output = viewer(root).args(["--diff", id]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn diffs_read_recorded_trees_without_cli_or_operations() {
+    let temp = fixture();
+    std::fs::write(temp.path().join("text.txt"), "old\n").unwrap();
+    std::fs::write(temp.path().join("deleted.txt"), "delete me\n").unwrap();
+    jj(temp.path(), &["new", "-m", "changes"]);
+    std::fs::write(temp.path().join("text.txt"), "new\n").unwrap();
+    std::fs::remove_file(temp.path().join("deleted.txt")).unwrap();
+    std::fs::write(temp.path().join("binary.dat"), [0, 1, 2]).unwrap();
+    std::fs::write(temp.path().join("large.txt"), vec![b'x'; 300_000]).unwrap();
+    jj(temp.path(), &["describe", "-m", "snapshot changes"]);
+    let snapshot = snapshot(temp.path());
+    let current = snapshot["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["working_copy"] == true)
+        .unwrap();
+    let heads_before = heads(temp.path());
+    std::fs::write(temp.path().join("text.txt"), "UNSNAPSHOTTED\n").unwrap();
+    let preview = diff(temp.path(), current["commit_id"].as_str().unwrap());
+    let files = preview["files"].as_array().unwrap();
+    let patch = |path| {
+        files.iter().find(|f| f["path"] == path).unwrap()["patch"]
+            .as_str()
+            .unwrap()
+    };
+    assert!(patch("text.txt").contains("-old\n+new\n"));
+    assert!(!patch("text.txt").contains("UNSNAPSHOTTED"));
+    assert!(patch("binary.dat").contains("binary file"));
+    assert!(patch("large.txt").contains("exceeds 256 KiB"));
+    assert!(patch("deleted.txt").contains("-delete me"));
+    assert_eq!(heads(temp.path()), heads_before);
+}
+
+#[test]
+fn merge_diff_uses_merged_parents_not_first_parent() {
+    let temp = fixture();
+    jj(temp.path(), &["bookmark", "create", "base"]);
+    jj(temp.path(), &["new", "base", "-m", "left"]);
+    std::fs::write(temp.path().join("left.txt"), "left\n").unwrap();
+    jj(temp.path(), &["bookmark", "create", "left"]);
+    jj(temp.path(), &["new", "base", "-m", "right"]);
+    std::fs::write(temp.path().join("right.txt"), "right\n").unwrap();
+    jj(temp.path(), &["bookmark", "create", "right"]);
+    jj(temp.path(), &["new", "left", "right", "-m", "merge"]);
+    let snapshot = snapshot(temp.path());
+    let current = snapshot["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["working_copy"] == true)
+        .unwrap();
+    assert_eq!(current["parents"].as_array().unwrap().len(), 2);
+    let preview = diff(temp.path(), current["commit_id"].as_str().unwrap());
+    assert!(preview["files"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn configurable_keys_validate_overrides_and_report_conflicts() {
+    let temp = fixture();
+    let config = temp.path().join("custom.toml");
+    std::fs::write(&config, "[revisions]\ndown=['ctrl+j']\nnew=[]\n").unwrap();
+    let output = viewer(temp.path())
+        .arg("--keybinds")
+        .arg(&config)
+        .arg("--check-keybinds")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ctrl+j"));
+    std::fs::write(&config, "[revisions]\nup=['j']\n").unwrap();
+    let output = viewer(temp.path())
+        .arg("--keybinds")
+        .arg(&config)
+        .arg("--check-keybinds")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("bound to both"));
+}
+
+#[test]
+fn native_revsets_load_repository_aliases_without_jj() {
+    let temp = fixture();
+    std::fs::write(
+        temp.path().join(".jj/repo/config.toml"),
+        "[revset-aliases]\n\"mine()\" = \"@\"\n",
+    )
+    .unwrap();
+    let output = viewer(temp.path())
+        .args(["--once", "-r", "mine()"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(snapshot["revisions"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["revisions"][0]["working_copy"], true);
+    let bad = viewer(temp.path())
+        .args(["--once", "-r", "this_function_does_not_exist()"])
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+}
+
+#[test]
+fn opt_in_native_snapshot_records_edits_without_jj() {
+    let temp = fixture();
+    let before = heads(temp.path());
+    std::fs::write(
+        temp.path().join("native.txt"),
+        "snapshotted without a subprocess\n",
+    )
+    .unwrap();
+    let output = viewer(temp.path())
+        .args(["--once", "--auto-snapshot"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(heads(temp.path()), before);
+    let snapshot: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let wc = snapshot["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["working_copy"] == true)
+        .unwrap();
+    let preview = diff(temp.path(), wc["commit_id"].as_str().unwrap());
+    assert!(
+        preview["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "native.txt")
+    );
+    let after = heads(temp.path());
+    let output = viewer(temp.path())
+        .args(["--once", "--auto-snapshot"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        heads(temp.path()),
+        after,
+        "idle snapshot must not create operations"
+    );
+}
+
+#[test]
+fn auto_snapshot_refuses_immutable_working_copy_without_creating_operation() {
+    let temp = fixture();
+    std::fs::write(
+        temp.path().join(".jj/repo/config.toml"),
+        "[revset-aliases]\n\"immutable_heads()\" = \"@\"\n",
+    )
+    .unwrap();
+    let before = heads(temp.path());
+    std::fs::write(
+        temp.path().join("edit.txt"),
+        "do not rewrite immutable commit",
+    )
+    .unwrap();
+    let output = viewer(temp.path())
+        .args(["--once", "--auto-snapshot"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("immutable"));
+    assert_eq!(heads(temp.path()), before);
+}
+
+#[test]
+fn native_auto_snapshot_streams_working_tree_edits_without_jj() {
+    let temp = fixture();
+    let watch = Watch::with_options(temp.path(), &["--auto-snapshot"]);
+    let initial = watch.until(|v| v["type"] == "repository");
+    std::fs::write(temp.path().join("auto-live.txt"), "live snapshot\n").unwrap();
+    let changed = watch.until(|v| {
+        v["type"] == "repository" && v["snapshot"]["operation"] != initial["snapshot"]["operation"]
+    });
+    let current = changed["snapshot"]["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["working_copy"] == true)
+        .unwrap();
+    let preview = diff(temp.path(), current["commit_id"].as_str().unwrap());
+    assert!(
+        preview["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "auto-live.txt")
+    );
+}
+
+#[test]
+fn secure_repo_and_workspace_config_are_loaded_without_migration() {
+    let temp = fixture();
+    let config_home = temp.path().join(".jj/test-config");
+    for (scope, key, value) in [
+        ("--repo", "revset-aliases.\"only_current()\"", "@"),
+        ("--workspace", "revset-aliases.\"only_root()\"", "root()"),
+    ] {
+        let output = Command::new("jj")
+            .args(["config", "set", scope, key, value])
+            .current_dir(temp.path())
+            .env("JJ_CONFIG", "")
+            .env("XDG_CONFIG_HOME", &config_home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let before = heads(temp.path());
+    for expression in ["only_current()", "only_root()"] {
+        let output = viewer(temp.path())
+            .env("XDG_CONFIG_HOME", &config_home)
+            .args(["--once", "-r", expression])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let snapshot: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(snapshot["revisions"].as_array().unwrap().len(), 1);
+    }
+    assert_eq!(heads(temp.path()), before);
 }

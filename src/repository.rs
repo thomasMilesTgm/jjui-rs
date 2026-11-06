@@ -3,12 +3,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use jj_lib::{
-    config::{ConfigLayer, ConfigSource, StackedConfig},
     default_backend_factories::{default_backend_factories, default_working_copy_factories},
+    fileset::FilesetAliasesMap,
     object_id::ObjectId,
-    repo::Repo,
-    revset::ResolvedRevsetExpression,
-    settings::UserSettings,
+    repo::{ReadonlyRepo, Repo},
+    revset::{
+        self, RevsetAliasesMap, RevsetDiagnostics, RevsetExtensions, RevsetParseContext,
+        RevsetWorkspaceContext, SymbolResolver,
+    },
+    ui_path::RepoPathUiConverter,
     workspace::Workspace,
 };
 use serde::Serialize;
@@ -34,6 +37,8 @@ pub struct Repository {
     workspace: Workspace,
     limit: usize,
     operation: Option<String>,
+    repo: Option<std::sync::Arc<ReadonlyRepo>>,
+    revset: String,
 }
 
 impl Repository {
@@ -43,20 +48,7 @@ impl Repository {
             .ancestors()
             .find(|p| p.join(".jj").is_dir())
             .context("No Jujutsu workspace found; run inside a jj repository")?;
-        let mut config = StackedConfig::with_defaults();
-        // No transactions or signing: these values only satisfy library settings.
-        config.add_layer(ConfigLayer::parse(
-            ConfigSource::EnvBase,
-            r#"
-            [user]
-            name = "jjui-rs"
-            email = ""
-            [operation]
-            hostname = "localhost"
-            username = "jjui-rs"
-        "#,
-        )?);
-        let settings = UserSettings::from_config_and_home_dir(config, None)?;
+        let settings = crate::settings::load(root)?;
         let workspace = Workspace::load(
             &settings,
             root,
@@ -67,7 +59,36 @@ impl Repository {
             workspace,
             limit,
             operation: None,
+            repo: None,
+            revset: "all()".into(),
         })
+    }
+
+    pub async fn snapshot(&mut self) -> Result<()> {
+        crate::snapshot::snapshot(&mut self.workspace).await
+    }
+
+    pub async fn preview(&self, id: &str) -> Result<crate::preview::Preview> {
+        crate::preview::load(self.repo.as_deref().context("Repository not loaded")?, id).await
+    }
+
+    pub async fn set_revset(&mut self, expression: String) -> Result<Snapshot> {
+        let previous = std::mem::replace(&mut self.revset, expression);
+        match self.refresh(true).await {
+            Ok(Some(snapshot)) => Ok(snapshot),
+            Ok(None) => unreachable!("forced refresh"),
+            Err(error) => {
+                self.revset = previous;
+                Err(error)
+            }
+        }
+    }
+    pub async fn listing(&self, query: crate::browser::Query) -> Result<crate::browser::Listing> {
+        crate::browser::load(
+            self.repo.as_deref().context("Repository not loaded")?,
+            query,
+        )
+        .await
     }
 
     pub fn root(&self) -> PathBuf {
@@ -97,9 +118,13 @@ impl Repository {
         let wc = repo
             .view()
             .get_wc_commit_id(self.workspace.workspace_name());
-        let revset = ResolvedRevsetExpression::all()
-            .within_visibility(repo.as_ref())
-            .evaluate(repo.as_ref())?;
+        let revset = evaluate_revset(
+            repo.as_ref(),
+            self.workspace.settings(),
+            &self.root(),
+            self.workspace.workspace_name(),
+            &self.revset,
+        )?;
         let mut revisions = Vec::new();
         let mut stream = revset.stream().take(self.limit);
         while let Some(id) = stream.next().await {
@@ -120,10 +145,68 @@ impl Repository {
                 working_copy: wc == Some(&id),
             });
         }
+        self.repo = Some(repo.clone());
         self.operation = Some(operation.clone());
         Ok(Some(Snapshot {
             operation,
             revisions,
         }))
     }
+}
+
+pub fn evaluate_revset(
+    repo: &ReadonlyRepo,
+    settings: &jj_lib::settings::UserSettings,
+    root: &Path,
+    workspace_name: &jj_lib::ref_name::WorkspaceName,
+    expression: &str,
+) -> Result<Box<dyn revset::Revset>> {
+    let mut aliases = RevsetAliasesMap::default();
+    for (name, body) in [
+        (
+            "trunk()",
+            "latest(remote_bookmarks(exact:\"main\") | remote_bookmarks(exact:\"master\"))",
+        ),
+        (
+            "builtin_immutable_heads()",
+            "trunk() | tags() | remote_bookmarks() | root()",
+        ),
+        ("immutable_heads()", "builtin_immutable_heads()"),
+        ("immutable()", "::immutable_heads()"),
+        ("mutable()", "~immutable()"),
+    ] {
+        aliases.insert(name, body.to_owned(), None)?;
+    }
+
+    for name in settings.table_keys("revset-aliases") {
+        let value: String = settings.get(["revset-aliases", name])?;
+        aliases.insert(name, value, None)?;
+    }
+    let mut fileset_aliases = FilesetAliasesMap::default();
+    for name in settings.table_keys("fileset-aliases") {
+        let value: String = settings.get(["fileset-aliases", name])?;
+        fileset_aliases.insert(name, value, None)?;
+    }
+    let extensions = RevsetExtensions::default();
+    let path_converter = RepoPathUiConverter::Fs {
+        cwd: root.to_owned(),
+        base: root.to_owned(),
+    };
+    let context = RevsetParseContext {
+        aliases_map: &aliases,
+        local_variables: Default::default(),
+        user_email: settings.user_email(),
+        date_pattern_context: chrono::Local::now().into(),
+        default_ignored_remote: Some(jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO),
+        fileset_aliases_map: &fileset_aliases,
+        extensions: &extensions,
+        workspace: Some(RevsetWorkspaceContext {
+            path_converter: &path_converter,
+            workspace_name,
+        }),
+    };
+    let parsed = revset::parse(&mut RevsetDiagnostics::new(), expression, &context)?;
+    let resolver = SymbolResolver::new(repo, extensions.symbol_resolvers());
+    let resolved = parsed.resolve_user_expression(repo, &resolver)?;
+    Ok(resolved.evaluate()?)
 }
