@@ -1,0 +1,5 @@
+[actions.describe]
+path = "describe.roto"
+
+[actions.inspect]
+path = "inspect.roto"

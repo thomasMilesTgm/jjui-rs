@@ -18,6 +18,13 @@ use std::{
 #[derive(Default)]
 struct App {
     keys: crate::keybinds::Keybinds,
+    repository_path: String,
+    plugin_session: Option<crate::plugins::Session>,
+    plugin_call: Option<crate::plugins::Call>,
+    plugin_computing: bool,
+    plugin_actions: VecDeque<crate::plugins::Action>,
+    plugin_choice: Option<crate::plugins::Choice>,
+    output_is_diff: bool,
     theme: crate::theme::Theme,
     chunks: Option<ChunkEditor>,
     pending_chunk: Option<crate::chunks::Request>,
@@ -114,6 +121,165 @@ enum Effect {
 }
 
 impl App {
+    fn start_plugin(&mut self, name: &str) {
+        if self.plugin_session.is_some() || self.pending_command {
+            self.notice = Some("An action is still running".into());
+            return;
+        }
+        let revision = self.snapshot.as_ref().and_then(|snapshot| {
+            self.selection
+                .selected()
+                .and_then(|index| snapshot.revisions.get(index))
+        });
+        let context = crate::plugins::Context {
+            repository: self.repository_path.clone(),
+            change: revision.map(|r| r.change_id.clone()).unwrap_or_default(),
+            commit: revision.map(|r| r.commit_id.clone()).unwrap_or_default(),
+            file: if matches!(self.view, View::Files | View::Chunks)
+                || (self.view == View::Diff && self.diff_file)
+            {
+                self.preview
+                    .as_ref()
+                    .and_then(|p| p.files.get(self.file_index))
+                    .map(|f| f.path.clone())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            },
+            changes: self.sources(),
+            files: self.selected_files(),
+            revset: self.revset.clone(),
+        };
+        self.plugin_session = Some(crate::plugins::Session {
+            name: name.into(),
+            context: context.clone(),
+            callback: None,
+        });
+        self.plugin_call = Some(crate::plugins::Call {
+            name: name.into(),
+            function: String::new(),
+            context,
+            response: Default::default(),
+        });
+        self.error = None;
+        self.notice = Some(format!("Running {name}…"));
+    }
+    fn plugin_error(&mut self, error: String) {
+        self.plugin_computing = false;
+        self.plugin_session = None;
+        self.plugin_actions.clear();
+        self.plugin_choice = None;
+        self.plugin_call = None;
+        self.error = Some(format!("Plugin: {error}"));
+        self.history.push(format!("Plugin error: {error}"));
+        if self.history.len() > 100 {
+            self.history.remove(0);
+        }
+        self.output = error;
+        self.output_is_diff = false;
+    }
+    fn resume_plugin(&mut self, response: crate::plugins::Response) {
+        let Some(session) = &mut self.plugin_session else {
+            return;
+        };
+        let Some(function) = session.callback.take() else {
+            return;
+        };
+        if function.is_empty() {
+            if !response.error.is_empty() {
+                self.plugin_error(response.error);
+            } else {
+                self.notice = Some(format!("{} completed", session.name));
+                self.plugin_session = None;
+            }
+        } else {
+            self.plugin_call = Some(crate::plugins::Call {
+                name: session.name.clone(),
+                function,
+                context: session.context.clone(),
+                response,
+            });
+        }
+    }
+    fn next_plugin_effect(&mut self) -> Option<Effect> {
+        use crate::plugins::{Action, Task};
+        while let Some(action) = self.plugin_actions.pop_front() {
+            if let Some(callback) = action.callback()
+                && let Some(session) = &mut self.plugin_session
+            {
+                session.callback = Some(callback.into());
+            }
+            let task = match action {
+                Action::Notify(text) => {
+                    self.notice = Some(text);
+                    continue;
+                }
+                Action::Diff(text) => {
+                    self.output = text;
+                    self.output_is_diff = true;
+                    self.view = View::Text;
+                    self.scroll = 0;
+                    continue;
+                }
+                Action::Select(id) => {
+                    if let Some(index) = self.snapshot.as_ref().and_then(|snapshot| {
+                        snapshot
+                            .revisions
+                            .iter()
+                            .position(|r| r.commit_id == id || r.change_id == id)
+                    }) {
+                        self.selection.select(Some(index));
+                        self.view = View::Revisions;
+                    } else {
+                        self.plugin_error(format!("Revision {id} is not in the current graph"));
+                        return None;
+                    }
+                    continue;
+                }
+                Action::Prompt { title, .. } => {
+                    self.start_input("plugin_prompt", &title, String::new(), false);
+                    return None;
+                }
+                Action::Choose { title, options, .. } => {
+                    self.plugin_choice = Some(crate::plugins::Choice {
+                        title,
+                        options,
+                        index: 0,
+                    });
+                    return None;
+                }
+                Action::ReadDiff { commit, .. } => Task::ReadDiff(commit),
+                Action::Command { args, .. } => {
+                    let spec = crate::commands::CommandSpec::new(args.clone());
+                    self.history.push(spec.display());
+                    if self.history.len() > 100 {
+                        self.history.remove(0);
+                    }
+                    Task::Command(args)
+                }
+                Action::Revset { expression, .. } => Task::Revset(expression),
+                Action::Refresh { .. } => Task::Refresh,
+            };
+            self.busy = true;
+            self.pending_command = true;
+            return Some(Effect::Request(crate::live::Request::Plugin(task)));
+        }
+        if !self.plugin_computing
+            && self.plugin_call.is_none()
+            && self
+                .plugin_session
+                .as_ref()
+                .is_some_and(|session| session.callback.is_none())
+        {
+            if let Some(session) = &self.plugin_session
+                && self.notice.as_deref() == Some(&format!("Running {}…", session.name))
+            {
+                self.notice = Some(format!("{} completed", session.name));
+            }
+            self.plugin_session = None;
+        }
+        None
+    }
     fn selected_id(&self) -> Option<&str> {
         self.snapshot
             .as_ref()?
@@ -266,6 +432,34 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Effect::None;
         }
+        if let Some(choice) = &mut self.plugin_choice {
+            match self.keys.resolve("choice", key).as_deref() {
+                Some("down") => {
+                    choice.index = (choice.index + 1).min(choice.options.len().saturating_sub(1))
+                }
+                Some("up") => choice.index = choice.index.saturating_sub(1),
+                Some("first") => choice.index = 0,
+                Some("last") => choice.index = choice.options.len().saturating_sub(1),
+                Some("submit") => {
+                    let value = choice.options[choice.index].clone();
+                    self.plugin_choice = None;
+                    self.resume_plugin(crate::plugins::Response {
+                        value,
+                        ..Default::default()
+                    });
+                }
+                Some("cancel") => {
+                    self.plugin_choice = None;
+                    self.resume_plugin(crate::plugins::Response {
+                        cancelled: true,
+                        ..Default::default()
+                    });
+                }
+                Some("quit") => return Effect::Quit,
+                _ => {}
+            }
+            return Effect::None;
+        }
         if self.input.is_some() {
             self.key_sequence.clear();
             let action = self.keys.resolve("input", key);
@@ -316,6 +510,18 @@ impl App {
                 if self
                     .input
                     .as_ref()
+                    .is_some_and(|input| input.action == "plugin_prompt")
+                {
+                    self.input = None;
+                    self.resume_plugin(crate::plugins::Response {
+                        cancelled: true,
+                        ..Default::default()
+                    });
+                    return Effect::None;
+                }
+                if self
+                    .input
+                    .as_ref()
                     .is_some_and(|input| input.action == "bookmark_filter")
                 {
                     self.bookmark_filter.clear();
@@ -328,6 +534,13 @@ impl App {
             if matches!(action.as_deref(), Some("submit" | "accept")) {
                 let input = self.input.take().unwrap();
                 match input.action.as_str() {
+                    "plugin_prompt" => {
+                        self.resume_plugin(crate::plugins::Response {
+                            value: input.text,
+                            ..Default::default()
+                        });
+                        return Effect::None;
+                    }
                     "chunk_restore" | "chunk_split" => {
                         if let Some(mut request) = self.pending_chunk.take() {
                             request.description = input.text;
@@ -533,7 +746,11 @@ impl App {
             }
             return Effect::None;
         }
-        if self.pending_command
+        if action.starts_with("plugin.") {
+            self.start_plugin(&action);
+            return Effect::None;
+        }
+        if (self.pending_command || self.plugin_session.is_some())
             && matches!(
                 action.as_str(),
                 "new"
@@ -1109,6 +1326,7 @@ impl App {
                 return Effect::None;
             }
             "history" => {
+                self.output_is_diff = false;
                 self.output = self.history.join("\n");
                 self.view = View::Text;
                 self.scroll = 0;
@@ -1641,7 +1859,9 @@ pub fn run(
     keys: crate::keybinds::Keybinds,
     theme: crate::theme::Theme,
     theme_choice: Option<String>,
+    plugin_config: crate::plugins::Config,
 ) -> Result<()> {
+    let plugins = crate::plugins::Worker::start(plugin_config)?;
     let mut terminal = ratatui::init();
     crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
     let _mouse = MouseCapture;
@@ -1651,12 +1871,43 @@ pub fn run(
         let mut app = App {
             keys,
             theme,
+            repository_path: live.root.display().to_string(),
             revset: live.initial_revset.clone(),
             ..App::default()
         };
         loop {
+            loop {
+                match plugins.results.try_recv() {
+                    Ok(result) => {
+                        app.plugin_computing = false;
+                        match result {
+                            Ok(plan) => app.plugin_actions = plan.actions.into(),
+                            Err(error) => app.plugin_error(error),
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if app.plugin_computing {
+                            app.plugin_error("Plugin worker stopped unexpectedly".into());
+                        }
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                }
+            }
+            if let Some(call) = app.plugin_call.take() {
+                match plugins.calls.try_send(call) {
+                    Ok(()) => app.plugin_computing = true,
+                    Err(error) => app.plugin_error(error.to_string()),
+                }
+            }
             for update in live.updates.try_iter() {
                 match update {
+                    Update::PluginFinished(result) => {
+                        app.busy = false;
+                        app.pending_command = false;
+                        app.requested = None;
+                        app.resume_plugin(crate::plugins::Response::result(result));
+                    }
                     Update::Chunks { id, path, result } => {
                         app.busy = false;
                         if app.view == View::Chunks
@@ -1759,6 +2010,7 @@ pub fn run(
                                 {
                                     app.view = View::Revisions;
                                 }
+                                app.output_is_diff = false;
                                 app.output = output;
                                 app.follow_working_copy = ["jj new", "jj edit", "jj commit"]
                                     .iter()
@@ -1806,20 +2058,33 @@ pub fn run(
                     app.requested = Some(id);
                 }
             }
+            let plugin_effect = app.next_plugin_effect();
             terminal.draw(|frame| draw(frame, &mut app))?;
-            if !event::poll(Duration::from_millis(100))? {
-                continue;
-            }
-            let key = match event::read()? {
-                Event::Key(key) => key,
-                Event::Mouse(mouse) => {
-                    app.mouse(mouse);
+            let effect = if let Some(effect) = plugin_effect {
+                effect
+            } else {
+                if !event::poll(Duration::from_millis(100))? {
                     continue;
                 }
-                _ => continue,
+                let key = match event::read()? {
+                    Event::Key(key) => key,
+                    Event::Mouse(mouse) => {
+                        if app.plugin_choice.is_none()
+                            && !app
+                                .input
+                                .as_ref()
+                                .is_some_and(|input| input.action == "plugin_prompt")
+                        {
+                            app.mouse(mouse);
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let page_size = terminal.size()?.height.saturating_sub(6) as usize / 2;
+                app.handle_key(key, page_size)
             };
-            let page_size = terminal.size()?.height.saturating_sub(6) as usize / 2;
-            match app.handle_key(key, page_size) {
+            match effect {
                 Effect::ReloadTheme => {
                     match crate::theme::Theme::load(&live.root, theme_choice.as_deref()) {
                         Ok(theme) => {
@@ -1839,6 +2104,9 @@ pub fn run(
                         app.busy = false;
                         app.pending_command = false;
                         app.error = Some(error.to_string());
+                        if app.plugin_session.is_some() {
+                            app.plugin_error(error.to_string());
+                        }
                     }
                 }
                 Effect::External(spec) => {
@@ -1997,6 +2265,37 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             area,
         );
     }
+    if let Some(choice) = &app.plugin_choice {
+        let area = frame.area();
+        let width = area.width.saturating_sub(4).min(80);
+        let height = area
+            .height
+            .saturating_sub(4)
+            .min(
+                choice
+                    .options
+                    .len()
+                    .saturating_add(2)
+                    .min(u16::MAX as usize) as u16,
+            )
+            .max(area.height.min(3));
+        let popup = ratatui::layout::Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(ratatui::widgets::Clear, popup);
+        let mut state = ListState::default().with_selected(Some(choice.index));
+        frame.render_stateful_widget(
+            List::new(choice.options.clone())
+                .block(Block::bordered().title(choice.title.clone()))
+                .highlight_style(Style::default().bg(Color::DarkGray))
+                .highlight_symbol("▸ "),
+            popup,
+            &mut state,
+        );
+    }
     app.theme.apply(frame.buffer_mut());
 }
 
@@ -2027,6 +2326,25 @@ fn footer_mode(app: &App) -> &'static str {
 }
 
 fn footer_hints(app: &App, width: usize) -> Line<'static> {
+    if app.plugin_choice.is_some() {
+        return render_footer_hints(
+            app,
+            width,
+            [
+                ("down", "next"),
+                ("up", "previous"),
+                ("submit", "choose"),
+                ("cancel", "cancel"),
+            ]
+            .into_iter()
+            .filter_map(|(action, label)| {
+                app.keys
+                    .hint("choice", action)
+                    .map(|key| (key, label.into()))
+            }),
+        );
+    }
+
     let scope = match app.view {
         View::Revisions => "revisions",
         View::Files => "files",
@@ -2037,6 +2355,34 @@ fn footer_hints(app: &App, width: usize) -> Line<'static> {
         View::Git => "git",
         _ => "view",
     };
+    if app.input.is_none() && !app.key_sequence.is_empty() && app.key_sequence_scope == scope {
+        let mut hints: Vec<_> = app
+            .keys
+            .continuations(scope, &app.key_sequence)
+            .into_iter()
+            .map(|(key, action)| {
+                let label = match action.as_str() {
+                    "first" => match app.view {
+                        View::Revisions => "first revision",
+                        View::Files | View::Finder => "first file",
+                        View::Chunks => "first hunk",
+                        View::Operations | View::InlineOperations => "first operation",
+                        _ => "first",
+                    }
+                    .into(),
+                    "git" => "Git".into(),
+                    "theme_reload" => "reload theme".into(),
+                    "focus" => "switch focus".into(),
+                    _ => action.trim_start_matches("plugin.").replace('_', " "),
+                };
+                (key, label)
+            })
+            .collect();
+        if let Some(key) = app.keys.hint(scope, "cancel") {
+            hints.push((key, "cancel".into()));
+        }
+        return render_footer_hints(app, width, hints);
+    }
     let mut hints: Vec<(&str, &str, &str)> = Vec::new();
     if let Some(input) = &app.input {
         hints.extend([
@@ -2189,13 +2535,28 @@ fn footer_hints(app: &App, width: usize) -> Line<'static> {
             }
         }
     }
+    let hints = hints.into_iter().filter_map(|(scope, action, label)| {
+        app.keys
+            .hint(scope, action)
+            .map(|key| (key, label.to_owned()))
+    });
+    let plugin_hints = if app.input.is_none() && app.target.is_none() {
+        app.keys.plugin_hints(scope)
+    } else {
+        Vec::new()
+    };
+    render_footer_hints(app, width, hints.chain(plugin_hints))
+}
+
+fn render_footer_hints(
+    app: &App,
+    width: usize,
+    hints: impl IntoIterator<Item = (String, String)>,
+) -> Line<'static> {
     let (key_color, action_color, separator_color) = app.theme.hint_colors();
     let mut spans = Vec::new();
     let mut used = 0;
-    for (scope, action, label) in hints {
-        let Some(key) = app.keys.hint(scope, action) else {
-            continue;
-        };
+    for (key, label) in hints {
         let key = if key.split_whitespace().all(|part| part.chars().count() == 1) {
             key.replace(' ', "")
         } else {
@@ -2402,7 +2763,14 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
                     app.output
                 ),
             ),
-            _ => (" Command output / history ", app.output.clone()),
+            _ => (
+                if app.output_is_diff {
+                    " Plugin diff "
+                } else {
+                    " Command output / history "
+                },
+                app.output.clone(),
+            ),
         };
         draw_text(
             frame,
@@ -2410,7 +2778,8 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
             title,
             &text,
             &mut app.scroll,
-            matches!(app.view, View::Diff | View::OperationDiff),
+            matches!(app.view, View::Diff | View::OperationDiff)
+                || (app.view == View::Text && app.output_is_diff),
         );
         return;
     }
@@ -3934,6 +4303,56 @@ mod tests {
     }
 
     #[test]
+    fn footer_hints_follow_pending_sequences_and_custom_continuations() {
+        let mut app = key_fixture();
+        press(&mut app, KeyCode::Char('g'));
+        let hints = footer_hints(&app, 200).to_string();
+        for expected in [
+            "g first revision",
+            "i Git",
+            "n new",
+            "v evolution",
+            "t reload theme",
+            "? help",
+            "esc cancel",
+        ] {
+            assert!(hints.contains(expected), "{expected}: {hints}");
+        }
+        assert!(!hints.contains("l files"));
+        press(&mut app, KeyCode::Esc);
+        assert!(footer_hints(&app, 200).to_string().contains("l files"));
+        app.keys
+            .merge("[revisions]\nnew=['z x n', 'z x m']\nevolution=[]")
+            .unwrap();
+        press(&mut app, KeyCode::Char('z'));
+        assert!(footer_hints(&app, 200).to_string().contains("xn new"));
+        press(&mut app, KeyCode::Char('x'));
+        let hints = footer_hints(&app, 200).to_string();
+        assert!(hints.contains("n new") && hints.contains("m new"));
+        assert!(!hints.contains("Git"));
+        for width in [1, 10, 40] {
+            assert!(footer_hints(&app, width).width() <= width);
+        }
+        press(&mut app, KeyCode::Char('!'));
+        assert!(footer_hints(&app, 200).to_string().contains("l files"));
+        app.view = View::Files;
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL), 2);
+        assert!(
+            footer_hints(&app, 200)
+                .to_string()
+                .contains("w switch focus")
+        );
+        press(&mut app, KeyCode::Char('w'));
+        assert!(
+            !footer_hints(&app, 200)
+                .to_string()
+                .contains("w switch focus")
+        );
+        press(&mut app, KeyCode::Char('Z'));
+        assert!(footer_hints(&app, 200).to_string().contains("Q quit"));
+    }
+
+    #[test]
     fn footer_hints_follow_mode_overrides_and_prompt_state() {
         let mut app = key_fixture();
         assert!(footer_hints(&app, 200).to_string().contains("l files"));
@@ -4169,6 +4588,25 @@ mod tests {
             panic!("expected rebase")
         };
         assert_eq!(spec.args, vec!["rebase", "-r", "other", "-o", "match-one"]);
+    }
+    #[test]
+    fn plugin_prompt_cancellation_resumes_callback_with_original_context() {
+        let mut app = key_fixture();
+        app.start_plugin("plugin.example");
+        let context = app.plugin_call.take().unwrap().context;
+        app.plugin_actions
+            .push_back(crate::plugins::Action::Prompt {
+                title: "Example".into(),
+                callback: "answered".into(),
+            });
+        assert!(app.next_plugin_effect().is_none());
+        assert_eq!(press(&mut app, KeyCode::Esc), Effect::None);
+        assert!(app.input.is_none());
+        let call = app.plugin_call.take().unwrap();
+        assert_eq!(call.function, "answered");
+        assert!(call.response.cancelled);
+        assert_eq!(call.context, context);
+        assert!(!app.pending_command);
     }
     #[test]
     fn input_characters_do_not_trigger_actions_and_cancel_has_no_mutation() {

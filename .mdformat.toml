@@ -1,0 +1,3 @@
+# Requires mdformat-gfm for table formatting.
+wrap = 100
+extensions = ["gfm"]

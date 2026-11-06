@@ -7,6 +7,7 @@ mod input;
 mod keybinds;
 mod live;
 mod operations;
+mod plugins;
 mod preview;
 mod repository;
 mod settings;
@@ -33,6 +34,12 @@ struct Args {
     /// Explicit keybinds.toml (otherwise global and repository files are layered)
     #[arg(long)]
     keybinds: Option<PathBuf>,
+    /// Plugin manifest (defaults to the global jjui-rs/plugins.toml)
+    #[arg(long)]
+    plugins: Option<PathBuf>,
+    /// Compile plugins and validate their entrypoints without running them
+    #[arg(long)]
+    check_plugins: bool,
     /// Theme: default, dark, light, or a theme.toml path
     #[arg(long)]
     theme: Option<String>,
@@ -93,7 +100,18 @@ fn main() -> Result<()> {
         println!("{}", toml::to_string_pretty(&theme)?);
         return Ok(());
     }
-    let keys = keybinds::Keybinds::load(&args.repository, args.keybinds.as_deref())?;
+    let plugins = plugins::Config::load(args.plugins.as_deref())?;
+    if args.check_plugins {
+        for name in plugins::check(plugins)? {
+            println!("plugin.{name}");
+        }
+        return Ok(());
+    }
+    let keys = keybinds::Keybinds::load_with_plugins(
+        &args.repository,
+        args.keybinds.as_deref(),
+        &plugins.names(),
+    )?;
     if args.check_keybinds {
         println!("{}", keys.help());
         return Ok(());
@@ -135,6 +153,9 @@ fn main() -> Result<()> {
     if args.watch_json {
         for update in &live.updates {
             let value = match update {
+                live::Update::PluginFinished(result) => {
+                    serde_json::json!({"type":"plugin","result":result})
+                }
                 live::Update::Chunks { id, path, result } => {
                     serde_json::json!({"type":"chunks","id":id,"path":path,"result":result})
                 }
@@ -166,6 +187,6 @@ fn main() -> Result<()> {
         }
         Ok(())
     } else {
-        ui::run(live, keys, theme, args.theme)
+        ui::run(live, keys, theme, args.theme, plugins)
     }
 }

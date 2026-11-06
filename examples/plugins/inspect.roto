@@ -1,0 +1,21 @@
+fn run(ctx: Context, result: Response) -> Plan {
+    Plan.new().choose("Inspect selection", ["Show diff", "Show change ID"], "chosen")
+}
+
+fn chosen(ctx: Context, result: Response) -> Plan {
+    if result.cancelled() {
+        Plan.new()
+    } else if result.value() == "Show diff" {
+        Plan.new().read_diff(ctx.commit_id(), "show_diff")
+    } else {
+        Plan.new().notify("Selected change: " + ctx.change_id())
+    }
+}
+
+fn show_diff(ctx: Context, result: Response) -> Plan {
+    if result.ok() {
+        Plan.new().diff(result.value())
+    } else {
+        Plan.new().notify(result.error())
+    }
+}

@@ -1,0 +1,27 @@
+// Every entrypoint and callback has the same typed signature.
+fn run(ctx: Context, result: Response) -> Plan {
+    if ctx.change_id() == "" {
+        Plan.new().notify("Select a revision first")
+    } else {
+        Plan.new().prompt("Describe selected revision", "describe")
+    }
+}
+
+fn describe(ctx: Context, result: Response) -> Plan {
+    if result.cancelled() {
+        Plan.new().notify("Description cancelled")
+    } else {
+        Plan.new().command(
+            ["describe", "-r", ctx.change_id(), "--message=" + result.value()],
+            "finished"
+        )
+    }
+}
+
+fn finished(ctx: Context, result: Response) -> Plan {
+    if result.ok() {
+        Plan.new().notify("Description updated by Roto")
+    } else {
+        Plan.new().notify(result.error())
+    }
+}

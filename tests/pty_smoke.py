@@ -6,6 +6,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -30,7 +31,9 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
     subprocess.run(['git', 'init', '--bare', '--quiet', str(remote)], env=env, check=True)
     jj('git', 'remote', 'add', 'origin', str(remote))
     keys = root / '.jj/keybinds.toml'
-    keys.write_text('[revisions]\nnew=["x"]\n')
+    keys.write_text('[revisions]\nnew=["x"]\n"plugin.describe"=["z d"]\n"plugin.inspect"=["z i"]\n')
+    plugins = root / '.jj/test-plugins'
+    shutil.copytree(Path(__file__).resolve().parents[1] / 'examples/plugins', plugins)
 
     def snapshot():
         result = subprocess.run([binary, '-R', str(root), '--once'], env={**env, 'PATH': ''}, capture_output=True, check=True)
@@ -44,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 150, 0, 0))
     original = termios.tcgetattr(slave)
-    process = subprocess.Popen([binary, '-R', str(root), '--keybinds', str(keys), '--theme', str(theme)], stdin=slave, stdout=slave, stderr=slave, env=env)
+    process = subprocess.Popen([binary, '-R', str(root), '--keybinds', str(keys), '--theme', str(theme), '--plugins', str(plugins / 'plugins.toml')], stdin=slave, stdout=slave, stderr=slave, env=env)
     output = bytearray()
 
     def read(timeout=.1):
@@ -192,6 +195,32 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
         shown('Revision expression')
         send(b'\x01\x1b[3~\x1b[3~\x1b[3~\x1b[3~\x1b[3~@\r')
         shown('revset: @')
+        original_op = snapshot()['operation']
+        send(b'zd')
+        shown('Describe selected revision')
+        send(b'\x1b')
+        shown('Description cancelled')
+        assert snapshot()['operation'] == original_op
+        send(b'zd')
+        shown('Describe selected revision')
+        send(b'roto ; $(literal)\r')
+        shown('Description updated by Roto')
+        assert current()['description'].strip() == 'roto ; $(literal)'
+        send(b'zi')
+        shown('Inspect selection')
+        send(b'j\r')
+        shown('Selected change:')
+        send(b'zi')
+        shown('Inspect selection')
+        send(b'\r')
+        shown('Plugin diff')
+        send(b'h')
+        script = plugins / 'inspect.roto'
+        script.write_text(script.read_text().replace('Selected change: ', 'Reloaded selection: '))
+        send(b'zi')
+        shown('Inspect selection')
+        send(b'j\r')
+        shown('Reloaded selection:')
         send(b'a')
         shown('Confirm abandon')
         send(b'\x1b')
@@ -204,7 +233,7 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
             read()
         assert process.wait(timeout=1) == 0
         assert termios.tcgetattr(slave) == original
-        print('PTY smoke passed: theme reload, remapping, new/describe, bookmarks, operations, hunk restore/split, file finder, revsets, cancellation, terminal restoration')
+        print('PTY smoke passed: theme reload, remapping, new/describe, bookmarks, operations, hunk restore/split, file finder, revsets, Roto prompts/commands/diffs/reload, cancellation, terminal restoration')
     finally:
         if process.poll() is None:
             process.kill()

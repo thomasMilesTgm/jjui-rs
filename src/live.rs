@@ -10,6 +10,7 @@ use std::{
 
 #[derive(Debug, PartialEq)]
 pub enum Request {
+    Plugin(crate::plugins::Task),
     Chunks { id: String, path: String },
     ApplyChunks(crate::chunks::Request),
     Revset(String),
@@ -19,6 +20,7 @@ pub enum Request {
 }
 
 pub enum Update {
+    PluginFinished(Result<String, String>),
     Chunks {
         id: String,
         path: String,
@@ -153,6 +155,55 @@ pub fn start(
                         id,
                         path,
                     },
+                    Request::Plugin(task) => {
+                        let result = match task {
+                            crate::plugins::Task::ReadDiff(id) => runtime
+                                .block_on(repo.preview(&id))
+                                .map(|preview| {
+                                    preview
+                                        .files
+                                        .iter()
+                                        .map(|file| format!("{}\n{}", file.path, file.patch))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .map_err(|error| format!("{error:#}")),
+                            crate::plugins::Task::Command(args) => {
+                                let result = crate::commands::execute(
+                                    &root,
+                                    &crate::commands::CommandSpec::new(args),
+                                )
+                                .map_err(|e| format!("{e:#}"));
+                                if let Ok(Some(snapshot)) = runtime.block_on(repo.refresh(true)) {
+                                    let _ = send.send(Update::Repository(snapshot));
+                                }
+                                result
+                            }
+                            crate::plugins::Task::Revset(expression) => {
+                                match runtime.block_on(repo.set_revset(expression.clone())) {
+                                    Ok(snapshot) => {
+                                        let _ = send.send(Update::Repository(snapshot));
+                                        let _ =
+                                            send.send(Update::RevsetApplied(expression.clone()));
+                                        Ok(expression)
+                                    }
+                                    Err(error) => Err(format!("{error:#}")),
+                                }
+                            }
+                            crate::plugins::Task::Refresh => {
+                                match runtime.block_on(repo.refresh(true)) {
+                                    Ok(snapshot) => {
+                                        if let Some(snapshot) = snapshot {
+                                            let _ = send.send(Update::Repository(snapshot));
+                                        }
+                                        Ok(String::new())
+                                    }
+                                    Err(error) => Err(format!("{error:#}")),
+                                }
+                            }
+                        };
+                        Update::PluginFinished(result)
+                    }
                     Request::ApplyChunks(request) => {
                         let result =
                             crate::chunks::apply(&root, &request).map_err(|e| format!("{e:#}"));

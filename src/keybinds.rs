@@ -19,14 +19,24 @@ pub struct Keybinds {
 impl Default for Keybinds {
     fn default() -> Self {
         Self {
-            tables: toml::from_str(include_str!("default_keybinds.toml"))
+            tables: toml::from_str(include_str!("../keybinds/keybinds.default.toml"))
                 .expect("valid built-in keys"),
         }
     }
 }
 impl Keybinds {
-    pub fn load(repository: &Path, explicit: Option<&Path>) -> Result<Self> {
+    pub fn load_with_plugins(
+        repository: &Path,
+        explicit: Option<&Path>,
+        plugins: &[String],
+    ) -> Result<Self> {
         let mut keys = Self::default();
+        for name in plugins {
+            keys.tables
+                .get_mut("global")
+                .unwrap()
+                .insert(name.clone(), Vec::new());
+        }
         if let Some(path) = explicit {
             keys.overlay(path)?;
             return Ok(keys);
@@ -61,11 +71,19 @@ impl Keybinds {
         let overrides: Tables = toml::from_str(text)?;
         let mut tables = self.tables.clone();
         for (scope, actions) in overrides {
+            let registered: Vec<_> = tables["global"]
+                .keys()
+                .filter(|name| name.starts_with("plugin."))
+                .cloned()
+                .collect();
             let target = tables
                 .get_mut(&scope)
                 .with_context(|| format!("Unknown scope {scope}"))?;
             for (action, keys) in actions {
-                if !target.contains_key(&action) {
+                if !target.contains_key(&action)
+                    && !(registered.contains(&action)
+                        && !matches!(scope.as_str(), "input" | "choice"))
+                {
                     bail!("Unknown action {scope}.{action}");
                 }
                 for key in &keys {
@@ -141,6 +159,41 @@ impl Keybinds {
             BindingMatch::None
         }
     }
+    /// Remaining keys for bindings reachable from the active prefix, using the
+    /// same scope precedence and key normalization as dispatch.
+    pub fn continuations(&self, scope: &str, prefix: &[KeyEvent]) -> Vec<(String, String)> {
+        let prefix: Vec<_> = prefix.iter().copied().map(normalize).collect();
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+        let mut seen = Vec::new();
+        let mut hints = Vec::new();
+        for scope_name in [scope, "global"] {
+            if let Some(actions) = self.tables.get(scope_name) {
+                for (action, bindings) in actions {
+                    for binding in bindings {
+                        let sequence = parse_sequence(binding).expect("validated binding");
+                        if sequence.len() <= prefix.len()
+                            || !sequence.starts_with(&prefix)
+                            || seen.contains(&sequence)
+                            || self.resolve_sequence(scope, &sequence)
+                                != BindingMatch::Action(action.clone())
+                        {
+                            continue;
+                        }
+                        let suffix = binding
+                            .split_whitespace()
+                            .skip(prefix.len())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        hints.push((suffix, action.clone()));
+                        seen.push(sequence);
+                    }
+                }
+            }
+        }
+        hints
+    }
     pub fn help(&self) -> String {
         self.tables
             .iter()
@@ -166,6 +219,30 @@ impl Keybinds {
             .filter(|keys| !keys.is_empty())
             .map(|keys| keys.join("/"))
             .unwrap_or_else(|| "unbound".into())
+    }
+    pub fn plugin_hints(&self, scope: &str) -> Vec<(String, String)> {
+        let mut names = std::collections::BTreeSet::new();
+        for scope in [scope, "global"] {
+            if let Some(actions) = self.tables.get(scope) {
+                names.extend(
+                    actions
+                        .keys()
+                        .filter(|name| name.starts_with("plugin."))
+                        .cloned(),
+                );
+            }
+        }
+        names
+            .into_iter()
+            .filter_map(|name| {
+                self.hint(scope, &name).map(|key| {
+                    (
+                        key,
+                        name.trim_start_matches("plugin.").replace(['_', '-'], " "),
+                    )
+                })
+            })
+            .collect()
     }
     pub fn hint(&self, scope: &str, action: &str) -> Option<String> {
         self.tables

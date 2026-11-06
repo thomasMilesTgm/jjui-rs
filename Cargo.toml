@@ -7,11 +7,11 @@ rust-version = "1.97.1"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.28"
+crossterm = "0.29"
 futures = "0.3"
 jj-lib = "=0.46.0"
 notify = "8"
-ratatui = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
@@ -20,3 +20,4 @@ shell-words = "1"
 chrono = "0.4"
 
 tempfile = "3"
+roto = { version = "=0.13.0", default-features = false }
