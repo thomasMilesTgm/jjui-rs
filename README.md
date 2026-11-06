@@ -48,5 +48,11 @@ hunks, or `s` to split them into a change. Ctrl-E/Y scrolls within a long hunk.
 The editor checks for intervening edits before applying. It supports UTF-8 regular
 files up to 256 KiB; binary files, conflicts, and mode changes use whole-file tools.
 Action prompts and rebase source/destination markers stay inline in the graph.
+`B` edits bookmark text directly in the graph; `b` opens a floating operations menu.
+`gi` opens the Git menu; `:` opens a command prompt on the bottom status line.
+Use `m/d/f/t/u` to filter move/delete/forget/track/untrack actions, `/` to search,
+Tab to cycle remotes, and Enter to apply. Escape clears filters, then closes.
+Diverged local bookmarks show `*`; remote commits retain their `name@remote`
+labels, including the last matching state in inline operation history.
 The footer shows the active mode’s bindings, with colored keys and quieter labels;
 `hint_key`, `hint_action`, and `hint_separator` in the theme control those colors.

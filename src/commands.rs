@@ -199,11 +199,10 @@ pub fn action(
         "set_bookmark" => CommandSpec::new([
             "bookmark",
             "set",
-            "--allow-backwards",
             "-r",
             source,
             "--",
-            value,
+            &serde_json::to_string(value)?,
         ]),
         "bookmark_delete" => CommandSpec::new(["bookmark", "delete", "--", value]),
         "bookmark_track" => CommandSpec::new(["bookmark", "track", "--", value]),
@@ -309,12 +308,14 @@ mod tests {
     }
     fn run_action(root: &Path, name: &str, sources: &[String], value: &str, files: &[String]) {
         let spec = action(name, sources, value, files).unwrap();
+        run_spec(root, &spec).unwrap_or_else(|e| panic!("{}: {e:#}", spec.display()));
+    }
+    fn run_spec(root: &Path, spec: &CommandSpec) -> Result<String> {
         let mut process = spec.process(root).unwrap();
         process
             .env("JJ_CONFIG", "")
             .env("XDG_CONFIG_HOME", root.join(".jj/test-config"));
         execute_process(process, &spec.display())
-            .unwrap_or_else(|e| panic!("{}: {e:#}", spec.display()));
     }
     #[test]
     fn editing_actions_preserve_literal_descriptions_and_selected_sources() {
@@ -502,6 +503,204 @@ mod tests {
         run_action(root, "squash", std::slice::from_ref(&now), &first, &[]);
     }
     #[test]
+    fn bookmark_menu_moves_literal_names_and_inline_set_rejects_backwards() {
+        let temp = fixture();
+        let root = temp.path();
+        let first = current(root);
+        let name = "topic|special";
+        run_action(
+            root,
+            "set_bookmark",
+            std::slice::from_ref(&first.change_id),
+            name,
+            &[],
+        );
+        run_action(
+            root,
+            "set_bookmark",
+            std::slice::from_ref(&first.change_id),
+            "other",
+            &[],
+        );
+        run_action(root, "new", std::slice::from_ref(&first.change_id), "", &[]);
+        let child = current(root);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let load = |id: String| {
+            let mut repo = crate::repository::Repository::open(root, 100).unwrap();
+            runtime.block_on(repo.refresh(true)).unwrap();
+            runtime
+                .block_on(repo.listing(crate::browser::Query::BookmarkOperations(id)))
+                .unwrap()
+        };
+        let menu = load(child.commit_id.clone());
+        let moving = menu
+            .rows
+            .iter()
+            .filter_map(|row| row.bookmark.as_ref())
+            .find(|action| action.kind == "move" && action.name == name)
+            .unwrap();
+        run_spec(root, &CommandSpec::new(moving.args.clone())).unwrap();
+        let spec = action(
+            "set_bookmark",
+            std::slice::from_ref(&first.change_id),
+            name,
+            &[],
+        )
+        .unwrap();
+        assert!(!spec.args.iter().any(|arg| arg == "--allow-backwards"));
+        assert!(
+            run_spec(root, &spec).is_err(),
+            "B must not silently move a bookmark backwards"
+        );
+        let menu = load(first.commit_id.clone());
+        let moving = menu
+            .rows
+            .iter()
+            .filter_map(|row| row.bookmark.as_ref())
+            .find(|action| action.kind == "move" && action.name == name)
+            .unwrap();
+        assert!(moving.args.iter().any(|arg| arg == "--allow-backwards"));
+        run_spec(root, &CommandSpec::new(moving.args.clone())).unwrap();
+        let menu = load(first.commit_id);
+        assert!(
+            !menu
+                .rows
+                .iter()
+                .filter_map(|row| row.bookmark.as_ref())
+                .any(|action| action.kind == "move" && action.name == name)
+        );
+        let deleting = menu
+            .rows
+            .iter()
+            .filter_map(|row| row.bookmark.as_ref())
+            .find(|action| action.kind == "delete" && action.name == name)
+            .unwrap();
+        run_spec(root, &CommandSpec::new(deleting.args.clone())).unwrap();
+        let menu = load(child.commit_id);
+        assert!(
+            menu.rows
+                .iter()
+                .filter_map(|row| row.bookmark.as_ref())
+                .any(|action| action.name == "other")
+        );
+        assert!(
+            !menu
+                .rows
+                .iter()
+                .filter_map(|row| row.bookmark.as_ref())
+                .any(|action| action.name == name)
+        );
+    }
+
+    #[test]
+    fn divergent_remote_bookmarks_decorate_graph_and_exact_operation_boundary() {
+        let temp = fixture();
+        let root = temp.path();
+        std::fs::write(root.join(".jj/repo/config.toml"),
+            "[user]\nname='Test'\nemail='test@example.org'\n[revset-aliases]\n'immutable_heads()'='none()'\n").unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare", "--quiet"])
+                .arg(remote.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let source = current(root).change_id;
+        run_action(
+            root,
+            "describe",
+            std::slice::from_ref(&source),
+            "published",
+            &[],
+        );
+        run_action(
+            root,
+            "set_bookmark",
+            std::slice::from_ref(&source),
+            "main",
+            &[],
+        );
+        run_action(
+            root,
+            "remote_add",
+            &[],
+            &format!(
+                "origin {}",
+                shell_words::quote(&remote.path().display().to_string())
+            ),
+            &[],
+        );
+        run_action(root, "bookmark_track", &[], "main@origin", &[]);
+        run_action(root, "push", std::slice::from_ref(&source), "origin", &[]);
+        let original = current(root).commit_id;
+        assert_eq!(current(root).bookmarks, ["main"]);
+        // An unrelated operation immediately before the snapshot is still the correct anchor.
+        run_action(root, "set_bookmark", &["root()".into()], "unrelated", &[]);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut repo = crate::repository::Repository::open(root, 100).unwrap();
+        let boundary = runtime
+            .block_on(repo.refresh(true))
+            .unwrap()
+            .unwrap()
+            .operation;
+        std::fs::write(root.join("file"), "first snapshot").unwrap();
+        run_action(root, "snapshot", &[], "", &[]);
+        std::fs::write(root.join("file"), "second snapshot").unwrap();
+        run_action(root, "snapshot", &[], "", &[]);
+        let snapshot = runtime.block_on(repo.refresh(true)).unwrap().unwrap();
+        let local = snapshot.revisions.iter().find(|r| r.working_copy).unwrap();
+        assert!(
+            local.bookmarks.contains(&"main*".into()),
+            "{:?}",
+            snapshot.revisions
+        );
+        assert!(
+            snapshot
+                .revisions
+                .iter()
+                .any(|r| r.commit_id == original && r.bookmarks.contains(&"main@origin".into()))
+        );
+        let operations = runtime
+            .block_on(repo.listing(crate::browser::Query::CommitOperations(
+                local.commit_id.clone(),
+            )))
+            .unwrap();
+        let anchors: Vec<_> = operations
+            .rows
+            .iter()
+            .filter(|row| {
+                row.operation
+                    .as_ref()
+                    .unwrap()
+                    .bookmarks
+                    .contains(&"main@origin".into())
+            })
+            .collect();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].id, boundary);
+        assert_ne!(operations.rows[0].id, boundary);
+        run_action(root, "push", std::slice::from_ref(&source), "origin", &[]);
+        let snapshot = runtime.block_on(repo.refresh(true)).unwrap().unwrap();
+        assert_eq!(
+            snapshot
+                .revisions
+                .iter()
+                .find(|r| r.working_copy)
+                .unwrap()
+                .bookmarks,
+            ["main"]
+        );
+        assert!(
+            !snapshot
+                .revisions
+                .iter()
+                .any(|r| r.bookmarks.contains(&"main@origin".into()))
+        );
+    }
+
+    #[test]
     fn git_remote_roundtrip_and_native_listings() {
         let temp = fixture();
         let root = temp.path();
@@ -543,11 +742,31 @@ mod tests {
         run_action(root, "bookmark_track", &[], "main@origin", &[]);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let mut repo = crate::repository::Repository::open(root, 100).unwrap();
-        let snapshot = runtime.block_on(repo.refresh(true)).unwrap().unwrap();
+        runtime.block_on(repo.refresh(true)).unwrap().unwrap();
         let bookmarks = runtime
             .block_on(repo.listing(crate::browser::Query::Bookmarks))
             .unwrap();
         assert!(bookmarks.rows.iter().any(|r| r.id == "main@origin"));
+        let focused = current(root).commit_id;
+        for kind in ["untrack", "track"] {
+            runtime.block_on(repo.refresh(true)).unwrap();
+            let menu = runtime
+                .block_on(repo.listing(crate::browser::Query::BookmarkOperations(focused.clone())))
+                .unwrap();
+            assert!(menu.remotes.contains(&"origin".into()));
+            let item = menu
+                .rows
+                .iter()
+                .filter_map(|row| row.bookmark.as_ref())
+                .find(|action| {
+                    action.kind == kind
+                        && action.name == "main"
+                        && action.remote.as_deref() == Some("origin")
+                })
+                .unwrap_or_else(|| panic!("missing {kind}: {:?}", menu.rows));
+            run_spec(root, &CommandSpec::new(item.args.clone())).unwrap();
+        }
+        let snapshot = runtime.block_on(repo.refresh(true)).unwrap().unwrap();
         let operations = runtime
             .block_on(repo.listing(crate::browser::Query::Operations))
             .unwrap();

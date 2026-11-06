@@ -14,6 +14,7 @@ use serde::Serialize;
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Entry {
     pub parents: Vec<String>,
+    pub bookmarks: Vec<String>,
     pub current: bool,
     pub root: bool,
     pub snapshot: bool,
@@ -86,6 +87,19 @@ pub async fn load(repo: &ReadonlyRepo, commit: Option<&str>) -> Result<Vec<crate
     } else {
         None
     };
+    let mut remote_anchors = Vec::new();
+    if let Some(change) = &change {
+        for (symbol, remote) in repo.view().all_remote_bookmarks() {
+            if symbol.remote.as_str() == "git" {
+                continue;
+            }
+            for target in remote.target.present_adds() {
+                if repo.store().get_commit_async(target).await?.change_id() == change {
+                    remote_anchors.push((symbol.to_string(), format!("commit {}", target.hex())));
+                }
+            }
+        }
+    }
     let mut stream = Box::pin(jj_lib::op_walk::walk_ancestors(&[repo.operation().clone()]));
     let mut states = HashMap::new();
     let mut ancestry = HashMap::new();
@@ -95,12 +109,24 @@ pub async fn load(repo: &ReadonlyRepo, commit: Option<&str>) -> Result<Vec<crate
         let id = op.id().hex();
         let parents: Vec<_> = op.parent_ids().iter().map(ObjectId::hex).collect();
         ancestry.insert(id.clone(), parents.clone());
+        let mut bookmarks = Vec::new();
         if let Some(change) = &change {
             let state = match states.remove(&id) {
                 Some(state) => state,
                 None => change_state(repo, &op, change).await?,
             };
-            let mut related = parents.is_empty() && !state.is_empty();
+            remote_anchors.retain(|(name, target)| {
+                let matches = state.contains(target)
+                    && state
+                        .iter()
+                        .filter(|entry| entry.starts_with("commit "))
+                        .all(|entry| entry == target);
+                if matches {
+                    bookmarks.push(name.clone());
+                }
+                !matches
+            });
+            let mut related = !bookmarks.is_empty() || (parents.is_empty() && !state.is_empty());
             for parent in op.parents().await? {
                 let parent_id = parent.id().hex();
                 if !states.contains_key(&parent_id) {
@@ -117,9 +143,11 @@ pub async fn load(repo: &ReadonlyRepo, commit: Option<&str>) -> Result<Vec<crate
         }
         let m = op.metadata();
         rows.push(crate::browser::Row {
+            bookmark: None,
             id,
             label: m.description.clone(),
             operation: Some(Entry {
+                bookmarks,
                 parents,
                 current: op.id() == repo.operation().id(),
                 root: op.parent_ids().is_empty(),
@@ -289,6 +317,7 @@ mod tests {
         ]
         .into_iter()
         .map(|(id, parents)| crate::browser::Row {
+            bookmark: None,
             id: id.into(),
             label: id.into(),
             operation: Some(Entry {

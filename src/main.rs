@@ -1,3 +1,4 @@
+mod bookmarks;
 mod browser;
 mod chunks;
 mod commands;

@@ -142,18 +142,20 @@ impl Repository {
             self.workspace.settings(),
             &self.root(),
             self.workspace.workspace_name(),
-            &self.revset,
+            // all() excludes rewritten commits, even when a remote still points
+            // to one. Include those recorded remote states in the default graph.
+            if self.revset.trim() == "all()" {
+                "all() | remote_bookmarks()"
+            } else {
+                &self.revset
+            },
         )?;
         let mut revisions = Vec::new();
         let mut stream = revset.stream().take(self.limit);
         while let Some(id) = stream.next().await {
             let id = id?;
             let commit = repo.store().get_commit_async(&id).await?;
-            let bookmarks = repo
-                .view()
-                .local_bookmarks_for_commit(&id)
-                .map(|(name, _)| name.as_str().to_owned())
-                .collect();
+            let bookmarks = bookmark_labels(repo.view(), &id);
             revisions.push(Revision {
                 commit_id: id.hex(),
                 change_id: commit.change_id().reverse_hex(),
@@ -248,4 +250,34 @@ pub fn evaluate_revset(
     let resolver = SymbolResolver::new(repo, extensions.symbol_resolvers());
     let resolved = parsed.resolve_user_expression(repo, &resolver)?;
     Ok(resolved.evaluate()?)
+}
+
+// Match jj's decoration rules: tracked remotes are implicit only when equal.
+fn bookmark_labels(view: &jj_lib::view::View, id: &jj_lib::backend::CommitId) -> Vec<String> {
+    let mut labels = Vec::new();
+    for (name, target) in view.local_bookmarks_for_commit(id) {
+        let differs = view.all_remote_bookmarks().any(|(symbol, remote)| {
+            symbol.name == name
+                && symbol.remote.as_str() != "git"
+                && remote.is_tracked()
+                && remote.target != *target
+        });
+        labels.push(format!(
+            "{}{}",
+            name.as_str(),
+            if differs { "*" } else { "" }
+        ));
+    }
+    for (symbol, remote) in view.all_remote_bookmarks() {
+        if symbol.remote.as_str() == "git"
+            || !remote.target.present_adds().any(|target| target == id)
+        {
+            continue;
+        }
+        let local = view.get_local_bookmark(symbol.name);
+        if !remote.is_tracked() || local != &remote.target {
+            labels.push(symbol.to_string());
+        }
+    }
+    labels
 }

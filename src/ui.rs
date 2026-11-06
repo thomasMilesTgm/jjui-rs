@@ -37,6 +37,11 @@ struct App {
     operation_hit_rows: Vec<(ratatui::layout::Rect, usize)>,
     chunk_hit_rows: Vec<(ratatui::layout::Rect, usize, usize)>,
     browse_index: usize,
+    bookmark_completion: Option<(String, usize)>,
+    bookmark_category: String,
+    bookmark_filter: String,
+    bookmark_remotes: Vec<String>,
+    bookmark_remote: usize,
     file_filter: String,
     marked_files: HashSet<String>,
     revset: String,
@@ -264,7 +269,58 @@ impl App {
         if self.input.is_some() {
             self.key_sequence.clear();
             let action = self.keys.resolve("input", key);
+            if self
+                .input
+                .as_ref()
+                .is_some_and(|input| input.action == "set_bookmark")
+                && matches!(action.as_deref(), Some("complete" | "complete_back"))
+            {
+                let input = self.input.as_ref().unwrap();
+                let prefix = self
+                    .bookmark_completion
+                    .as_ref()
+                    .map(|(prefix, _)| prefix.as_str())
+                    .unwrap_or(&input.text);
+                let mut suggestions: Vec<_> = self
+                    .listing
+                    .iter()
+                    .filter_map(|row| row.bookmark.as_ref())
+                    .filter(|item| {
+                        item.kind == "move"
+                            && !item.args.iter().any(|arg| arg == "--allow-backwards")
+                            && item.name.starts_with(prefix)
+                    })
+                    .map(|item| item.name.clone())
+                    .collect();
+                suggestions.sort();
+                suggestions.dedup();
+                if !suggestions.is_empty() {
+                    let reverse = action.as_deref() == Some("complete_back");
+                    let index = self
+                        .bookmark_completion
+                        .as_ref()
+                        .map(|(_, index)| {
+                            (index + if reverse { suggestions.len() - 1 } else { 1 })
+                                % suggestions.len()
+                        })
+                        .unwrap_or(if reverse { suggestions.len() - 1 } else { 0 });
+                    self.bookmark_completion = Some((prefix.to_owned(), index));
+                    let input = self.input.as_mut().unwrap();
+                    input.text = suggestions[index].clone();
+                    input.cursor = input.text.len();
+                }
+                return Effect::None;
+            }
+            self.bookmark_completion = None;
             if action.as_deref() == Some("cancel") {
+                if self
+                    .input
+                    .as_ref()
+                    .is_some_and(|input| input.action == "bookmark_filter")
+                {
+                    self.bookmark_filter.clear();
+                    self.browse_index = 0;
+                }
                 self.input = None;
                 self.pending_chunk = None;
                 return Effect::None;
@@ -297,6 +353,11 @@ impl App {
                         self.search_backwards = input.action == "search_backward";
                         self.filter = input.text;
                         self.search_match(self.search_backwards, true);
+                        return Effect::None;
+                    }
+                    "bookmark_filter" => {
+                        self.bookmark_filter = input.text;
+                        self.browse_index = 0;
                         return Effect::None;
                     }
                     "file_filter" => {
@@ -337,10 +398,16 @@ impl App {
                         }
                     }
                 }
+                if input.action == "set_bookmark" {
+                    input.text = input.text.replace(' ', "-");
+                }
                 if matches!(input.action.as_str(), "search" | "search_backward") {
                     self.search_backwards = input.action == "search_backward";
                     self.filter = input.text.clone();
                     self.search_match(self.search_backwards, true);
+                } else if input.action == "bookmark_filter" {
+                    self.bookmark_filter = input.text.clone();
+                    self.browse_index = 0;
                 } else if input.action == "file_filter" {
                     self.file_filter = input.text.clone();
                     self.browse_index = 0;
@@ -500,6 +567,73 @@ impl App {
         {
             self.notice = Some("An action is still running".into());
             return Effect::None;
+        }
+        if matches!(self.view, View::Bookmarks | View::Git) {
+            match action.as_str() {
+                "bookmark_apply" => return self.apply_bookmark(),
+                "fetch" | "push" if self.view == View::Git => {
+                    if self.bookmark_category == action {
+                        return self.apply_bookmark();
+                    }
+                    self.bookmark_category = action.clone();
+                    self.browse_index = 0;
+                    return Effect::None;
+                }
+                "bookmark_move" | "bookmark_delete" | "bookmark_forget" | "bookmark_track"
+                | "bookmark_untrack" => {
+                    let kind = action.strip_prefix("bookmark_").unwrap();
+                    if self.bookmark_category == kind {
+                        if let Some(index) = self.listing_rows().iter().position(|row| {
+                            row.bookmark.as_ref().is_some_and(|action| {
+                                action.kind == "move"
+                                    && matches!(action.name.as_str(), "main" | "master")
+                            })
+                        }) {
+                            self.browse_index = index;
+                        }
+                        return self.apply_bookmark();
+                    }
+                    self.bookmark_category = kind.into();
+                    self.browse_index = 0;
+                    return Effect::None;
+                }
+                "bookmark_next_remote" | "bookmark_previous_remote" => {
+                    let count = self.bookmark_remotes.len();
+                    if count > 0 {
+                        self.bookmark_remote = (self.bookmark_remote
+                            + if action == "bookmark_next_remote" {
+                                1
+                            } else {
+                                count - 1
+                            })
+                            % count;
+                    }
+                    self.browse_index = 0;
+                    return Effect::None;
+                }
+                "search" => {
+                    self.start_input(
+                        "bookmark_filter",
+                        if self.view == View::Git {
+                            "Filter Git operations"
+                        } else {
+                            "Filter bookmark operations"
+                        },
+                        self.bookmark_filter.clone(),
+                        false,
+                    );
+                    return Effect::None;
+                }
+                "cancel"
+                    if !self.bookmark_category.is_empty() || !self.bookmark_filter.is_empty() =>
+                {
+                    self.bookmark_category.clear();
+                    self.bookmark_filter.clear();
+                    self.browse_index = 0;
+                    return Effect::None;
+                }
+                _ => {}
+            }
         }
         if action == "theme_reload" {
             return Effect::ReloadTheme;
@@ -710,7 +844,7 @@ impl App {
         }
         if matches!(
             self.view,
-            View::Operations | View::InlineOperations | View::Bookmarks | View::Finder
+            View::Operations | View::InlineOperations | View::Bookmarks | View::Git | View::Finder
         ) {
             let count = self.listing_rows().len();
             match action.as_str() {
@@ -790,12 +924,23 @@ impl App {
                 return Effect::None;
             }
             "set_bookmark" => {
+                self.view = View::Revisions;
+                self.preview_focus = false;
                 self.start_input(
                     &action,
                     "Set bookmark at selected revision",
                     String::new(),
                     false,
                 );
+                let sources = self.action_sources("set_bookmark");
+                self.input.as_mut().unwrap().sources = sources;
+                self.bookmark_completion = None;
+                self.listing.clear();
+                if let Some(id) = self.selected_id() {
+                    return Effect::Request(crate::live::Request::Listing(
+                        crate::browser::Query::BookmarkOperations(id.into()),
+                    ));
+                }
                 return Effect::None;
             }
             "rebase" | "squash" => {
@@ -863,12 +1008,20 @@ impl App {
                 return Effect::Request(crate::live::Request::Listing(query));
             }
             "bookmarks" => {
+                let Some(id) = self.selected_id().map(str::to_owned) else {
+                    return Effect::None;
+                };
                 self.view = View::Bookmarks;
+                self.preview_focus = false;
+                self.bookmark_category.clear();
+                self.bookmark_filter.clear();
+                self.bookmark_remote = 0;
+                self.bookmark_remotes = vec!["local".into()];
                 self.listing.clear();
                 self.browse_index = 0;
                 self.busy = true;
                 return Effect::Request(crate::live::Request::Listing(
-                    crate::browser::Query::Bookmarks,
+                    crate::browser::Query::BookmarkOperations(id),
                 ));
             }
             "file_search" => {
@@ -893,13 +1046,21 @@ impl App {
                 return Effect::None;
             }
             "git" => {
+                let Some(id) = self.selected_id().map(str::to_owned) else {
+                    return Effect::None;
+                };
                 self.view = View::Git;
-                return self.command_effect(crate::commands::CommandSpec::new([
-                    "git",
-                    "remote",
-                    "list",
-                    "--ignore-working-copy",
-                ]));
+                self.preview_focus = false;
+                self.listing.clear();
+                self.bookmark_remotes.clear();
+                self.bookmark_remote = 0;
+                self.bookmark_category.clear();
+                self.bookmark_filter.clear();
+                self.browse_index = 0;
+                self.busy = true;
+                return Effect::Request(crate::live::Request::Listing(
+                    crate::browser::Query::GitOperations(id),
+                ));
             }
             "fetch" | "push" => {
                 self.start_input(
@@ -1103,9 +1264,12 @@ impl App {
                         editor.index.saturating_sub(1)
                     };
                     editor.line_offset = 0;
-                } else if matches!(self.view, View::Operations | View::InlineOperations) {
+                } else if matches!(
+                    self.view,
+                    View::Operations | View::InlineOperations | View::Bookmarks | View::Git
+                ) {
                     self.browse_index = if down {
-                        (self.browse_index + 1).min(self.listing.len().saturating_sub(1))
+                        (self.browse_index + 1).min(self.listing_rows().len().saturating_sub(1))
                     } else {
                         self.browse_index.saturating_sub(1)
                     };
@@ -1145,7 +1309,19 @@ impl App {
     }
     fn accepts_listing(&self, query: &crate::browser::Query) -> bool {
         match query {
-            crate::browser::Query::Bookmarks => self.view == View::Bookmarks,
+            #[cfg(test)]
+            crate::browser::Query::Bookmarks => false,
+            crate::browser::Query::BookmarkOperations(id) => {
+                (self.view == View::Bookmarks
+                    || self
+                        .input
+                        .as_ref()
+                        .is_some_and(|input| input.action == "set_bookmark"))
+                    && self.selected_id() == Some(id)
+            }
+            crate::browser::Query::GitOperations(id) => {
+                self.view == View::Git && self.selected_id() == Some(id)
+            }
             crate::browser::Query::Operations => self.view == View::Operations,
             crate::browser::Query::CommitOperations(id) => {
                 self.view == View::InlineOperations && self.selected_id() == Some(id)
@@ -1155,10 +1331,46 @@ impl App {
             }
         }
     }
+    fn apply_bookmark(&mut self) -> Effect {
+        if self.pending_command {
+            return Effect::None;
+        }
+        if let Some(action) = self
+            .listing_rows()
+            .get(self.browse_index)
+            .and_then(|row| row.bookmark.as_ref())
+        {
+            return self.command_effect(crate::commands::CommandSpec::new(action.args.clone()));
+        }
+        Effect::None
+    }
     fn listing_rows(&self) -> Vec<&crate::browser::Row> {
         self.listing
             .iter()
             .filter(|row| self.view != View::Finder || fuzzy_match(&row.label, &self.file_filter))
+            .filter(|row| {
+                if !matches!(self.view, View::Bookmarks | View::Git) {
+                    return true;
+                }
+                let Some(action) = &row.bookmark else {
+                    return false;
+                };
+                let remote = self
+                    .bookmark_remotes
+                    .get(self.bookmark_remote)
+                    .map(String::as_str)
+                    .unwrap_or("local");
+                (if remote == "local" {
+                    action.local
+                } else {
+                    action.remote.as_deref() == Some(remote)
+                        && !(action.kind == "track" && action.local)
+                }) && (self.bookmark_category.is_empty() || action.kind == self.bookmark_category)
+                    && row
+                        .label
+                        .to_lowercase()
+                        .contains(&self.bookmark_filter.to_lowercase())
+            })
             .collect()
     }
     fn handle_navigation(&mut self, key: KeyEvent, page_size: usize) -> Effect {
@@ -1468,7 +1680,12 @@ pub fn run(
                             || matches!(app.view, View::Operations | View::InlineOperations)
                         {
                             let query = match app.view {
-                                View::Bookmarks => Some(crate::browser::Query::Bookmarks),
+                                View::Git => app
+                                    .selected_id()
+                                    .map(|id| crate::browser::Query::GitOperations(id.into())),
+                                View::Bookmarks => app
+                                    .selected_id()
+                                    .map(|id| crate::browser::Query::BookmarkOperations(id.into())),
                                 View::Operations => Some(crate::browser::Query::Operations),
                                 View::InlineOperations => app
                                     .selected_id()
@@ -1507,6 +1724,16 @@ pub fn run(
                                     .get(app.browse_index)
                                     .map(|r| r.id.clone());
                                 app.operation_graph = crate::operations::graph(&list.rows);
+                                if matches!(
+                                    list.query,
+                                    crate::browser::Query::BookmarkOperations(_)
+                                        | crate::browser::Query::GitOperations(_)
+                                ) {
+                                    app.bookmark_remotes = list.remotes;
+                                    app.bookmark_remote = app
+                                        .bookmark_remote
+                                        .min(app.bookmark_remotes.len().saturating_sub(1));
+                                }
                                 app.listing = list.rows;
                                 app.browse_index = selected
                                     .and_then(|id| {
@@ -1525,6 +1752,12 @@ pub fn run(
                                 if command.ends_with("selected hunks") {
                                     app.view = View::Files;
                                     app.chunks = None;
+                                }
+                                if (app.view == View::Bookmarks
+                                    && command.starts_with("jj bookmark "))
+                                    || (app.view == View::Git && command.starts_with("jj git "))
+                                {
+                                    app.view = View::Revisions;
                                 }
                                 app.output = output;
                                 app.follow_working_copy = ["jj new", "jj edit", "jj commit"]
@@ -1665,6 +1898,9 @@ fn prompt_lines(app: &App, prefix: &str, width: usize) -> Vec<Line<'static>> {
     let Some(input) = &app.input else {
         return Vec::new();
     };
+    if matches!(input.action.as_str(), "set_bookmark" | "command") {
+        return Vec::new();
+    }
     let mut text = vec![input.label.clone()];
     if input.confirm {
         if !input.text.is_empty() {
@@ -1721,11 +1957,13 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                     .as_ref()
                     .is_some_and(|editor| editor.session.is_some())
         }
-        View::Operations | View::Bookmarks | View::Finder => !app.listing_rows().is_empty(),
+        View::Operations | View::Finder => !app.listing_rows().is_empty(),
+        View::Bookmarks | View::Git => true,
         _ => false,
     };
     if let Some(input) = &app.input
         && !inline
+        && input.action != "command"
     {
         let area = frame.area();
         let height = area.height.saturating_sub(2).min(9);
@@ -1809,6 +2047,12 @@ fn footer_hints(app: &App, width: usize) -> Line<'static> {
             ),
             ("input", "cancel", "cancel"),
         ]);
+        if input.action == "set_bookmark" {
+            hints.extend([
+                ("input", "complete", "complete"),
+                ("input", "complete_back", "previous"),
+            ]);
+        }
         if !input.confirm {
             hints.extend([
                 ("input", "delete_word", "delete word"),
@@ -1838,6 +2082,8 @@ fn footer_hints(app: &App, width: usize) -> Line<'static> {
                 (scope, "up", "up"),
                 (scope, "details", "files"),
                 (scope, "diff", "diff"),
+                (scope, "set_bookmark", "bookmark"),
+                (scope, "bookmarks", "bookmark actions"),
                 (scope, "describe", "describe"),
                 (scope, "operations", "operations"),
                 (scope, "new", "new"),
@@ -1901,26 +2147,17 @@ fn footer_hints(app: &App, width: usize) -> Line<'static> {
                 ));
                 hints.push((scope, "cancel", "back"));
             }
-            View::Bookmarks => {
-                hints.extend([
-                    (scope, "down", "down"),
-                    (scope, "up", "up"),
-                    (scope, "set_bookmark", "set"),
-                ]);
-                if app
-                    .listing
-                    .get(app.browse_index)
-                    .is_some_and(|row| row.id.contains('@'))
-                {
-                    hints.extend([
-                        (scope, "bookmark_track", "track"),
-                        (scope, "bookmark_untrack", "untrack"),
-                    ]);
-                } else if !app.listing.is_empty() {
-                    hints.push((scope, "bookmark_delete", "delete"));
-                }
-                hints.push((scope, "cancel", "back"));
-            }
+            View::Bookmarks => hints.extend([
+                (scope, "bookmark_apply", "apply"),
+                (scope, "bookmark_move", "move"),
+                (scope, "bookmark_delete", "delete"),
+                (scope, "bookmark_forget", "forget"),
+                (scope, "bookmark_track", "track"),
+                (scope, "bookmark_untrack", "untrack"),
+                (scope, "search", "filter"),
+                (scope, "bookmark_next_remote", "remote"),
+                (scope, "cancel", "back"),
+            ]),
             View::Finder => hints.extend([
                 (scope, "down", "down"),
                 (scope, "up", "up"),
@@ -1929,10 +2166,13 @@ fn footer_hints(app: &App, width: usize) -> Line<'static> {
                 (scope, "cancel", "back"),
             ]),
             View::Git => hints.extend([
+                (scope, "bookmark_apply", "apply"),
                 (scope, "fetch", "fetch"),
                 (scope, "push", "push"),
                 (scope, "remote_add", "add remote"),
                 (scope, "remote_remove", "remove remote"),
+                (scope, "bookmark_next_remote", "remote"),
+                (scope, "search", "filter"),
                 (scope, "cancel", "back"),
             ]),
             View::Diff | View::OperationDiff | View::Help | View::Text => {
@@ -2012,7 +2252,7 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
         ])),
         header,
     );
-    let status = app
+    let mut status = app
         .error
         .as_deref()
         .or(app.notice.as_deref())
@@ -2025,12 +2265,48 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
                 app.revset
             )
         });
+    let command_input = app.input.as_ref().filter(|input| input.action == "command");
+    if let Some(input) = command_input {
+        status = format!(":{}", input.visible());
+        // Keep the cursor visible when a command exceeds the terminal width.
+        let before = format!(":{}", &input.text[..input.cursor]);
+        let skip = Line::raw(before)
+            .width()
+            .saturating_sub(footer.width.saturating_sub(1) as usize);
+        let mut columns = 0;
+        status = status
+            .chars()
+            .skip_while(|c| {
+                if columns >= skip {
+                    false
+                } else {
+                    columns += Span::raw(c.to_string()).width();
+                    true
+                }
+            })
+            .collect();
+    }
+    if command_input.is_some()
+        && footer.height >= 2
+        && footer.width > 0
+        && let Some(index) = status.find('▏')
+    {
+        frame.set_cursor_position((
+            footer.x
+                + Line::raw(&status[..index])
+                    .width()
+                    .min(footer.width as usize - 1) as u16,
+            footer.bottom() - 1,
+        ));
+    }
     frame.render_widget(
         Paragraph::new(vec![
             footer_hints(app, footer.width as usize),
             Line::styled(
                 status,
-                Style::default().fg(if app.error.is_some() {
+                Style::default().fg(if command_input.is_some() {
+                    Color::Yellow
+                } else if app.error.is_some() {
                     Color::Red
                 } else {
                     Color::DarkGray
@@ -2043,7 +2319,13 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
         draw_operations(frame, body, app);
         return;
     }
-    if matches!(app.view, View::Bookmarks | View::Finder) {
+    if matches!(app.view, View::Bookmarks | View::Git) {
+        draw_graph(frame, body, app);
+        app.hit_rows.clear();
+        draw_bookmarks(frame, body, app);
+        return;
+    }
+    if app.view == View::Finder {
         let rows = app.listing_rows();
         let items: Vec<_> = rows
             .iter()
@@ -2184,6 +2466,7 @@ fn revision_header(
     revision: &crate::repository::Revision,
     node: &str,
     marked: bool,
+    editor: Option<&crate::input::Input>,
 ) -> Line<'static> {
     let wc = revision.working_copy;
     let mut spans = vec![Span::styled(
@@ -2231,6 +2514,15 @@ fn revision_header(
                 }),
             ));
         }
+    }
+    if let Some(input) = editor {
+        spans.push(Span::styled(
+            input.visible(),
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
     }
     spans.extend(log_id(
         &revision.commit_id,
@@ -2330,6 +2622,12 @@ fn operation_lines(
         Span::raw(" "),
     ];
     spans.extend(log_id_width(&row.id, op.prefix_len, blue, 12));
+    if !op.bookmarks.is_empty() {
+        spans.push(Span::styled(
+            format!(" {}", op.bookmarks.join(" ")),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
     if op.root {
         spans.push(Span::styled(" root()", Style::default().fg(Color::Green)));
         return vec![Line::from(spans).style(style)];
@@ -2475,6 +2773,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
     let mut targets = Vec::new();
     let mut operation_rows = std::collections::HashMap::new();
     let mut chunk_rows = std::collections::HashMap::new();
+    let mut bookmark_cursor = None;
     if let Some(snapshot) = &app.snapshot {
         for (i, revision) in snapshot.revisions.iter().enumerate() {
             let graph = &app.graph[i];
@@ -2492,7 +2791,21 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                 revision,
                 &graph.node,
                 app.marked.contains(&revision.commit_id),
+                app.input
+                    .as_ref()
+                    .filter(|input| selected && input.action == "set_bookmark"),
             );
+            if selected
+                && app
+                    .input
+                    .as_ref()
+                    .is_some_and(|input| input.action == "set_bookmark")
+            {
+                let text = header.to_string();
+                if let Some(index) = text.find('▏') {
+                    bookmark_cursor = Some((items.len(), Line::raw(&text[..index]).width()));
+                }
+            }
             if let Some((action, sources, _)) = &app.target {
                 if sources.contains(&revision.change_id) {
                     header.spans.push(Span::styled(
@@ -2524,6 +2837,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
             if selected
                 && app.input.is_some()
                 && app.view != View::Chunks
+                && app.view != View::Bookmarks
                 && (app.view != View::InlineOperations || app.listing.is_empty())
             {
                 for line in prompt_lines(
@@ -2742,6 +3056,18 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
         area,
         &mut app.graph_selection,
     );
+    if let Some((row, column)) = bookmark_cursor {
+        let offset = app.graph_selection.offset();
+        if row >= offset
+            && row - offset < area.height.saturating_sub(2) as usize
+            && column + 3 < area.width.saturating_sub(1) as usize
+        {
+            frame.set_cursor_position((
+                area.x + 3 + column as u16,
+                area.y + 1 + (row - offset) as u16,
+            ));
+        }
+    }
     for (row, (revision, file)) in targets
         .into_iter()
         .skip(app.graph_selection.offset())
@@ -2838,6 +3164,127 @@ fn short(value: &str) -> &str {
     &value[..value.len().min(12)]
 }
 
+fn draw_bookmarks(frame: &mut ratatui::Frame, body: ratatui::layout::Rect, app: &mut App) {
+    let width = body.width.saturating_sub(4).min(90).max(body.width.min(4));
+    let height = body
+        .height
+        .saturating_sub(4)
+        .min(24)
+        .max(body.height.min(4));
+    let popup = ratatui::layout::Rect::new(
+        body.x + (body.width - width) / 2,
+        body.y + (body.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::bordered().title(if app.view == View::Git {
+        " Git Operations "
+    } else {
+        " Bookmark Operations "
+    });
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [remote_area, filter_area, list_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
+    let mut remotes = vec![Span::styled(
+        "Remotes: ",
+        Style::default().fg(Color::DarkGray),
+    )];
+    for (index, name) in app.bookmark_remotes.iter().enumerate() {
+        remotes.push(Span::styled(
+            format!(" {name} "),
+            if index == app.bookmark_remote {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(remotes)), remote_area);
+    let filter = if let Some(input) = &app.input
+        && input.action != "command"
+    {
+        format!("{}: {}", input.label, input.visible())
+    } else {
+        format!(
+            "Showing: {}{}",
+            if app.bookmark_category.is_empty() {
+                "all actions"
+            } else {
+                &app.bookmark_category
+            },
+            if app.bookmark_filter.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", app.bookmark_filter)
+            }
+        )
+    };
+    frame.render_widget(Paragraph::new(filter), filter_area);
+    let rows = app.listing_rows();
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(if app.busy {
+                "Loading…"
+            } else {
+                if app.view == View::Git {
+                    "No matching Git operations · a adds a remote"
+                } else {
+                    "No matching bookmark operations"
+                }
+            })
+            .style(Style::default().fg(Color::DarkGray)),
+            list_area,
+        );
+        return;
+    }
+    let items = rows
+        .iter()
+        .map(|row| {
+            let command = row
+                .bookmark
+                .as_ref()
+                .map(|action| crate::commands::CommandSpec::new(action.args.clone()).display())
+                .unwrap_or_default();
+            ListItem::new(vec![
+                Line::raw(row.label.clone()),
+                Line::styled(command, Style::default().fg(Color::DarkGray)),
+                Line::raw(""),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(app.browse_index.min(items.len() - 1)));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(Style::default().bg(Color::DarkGray))
+            .highlight_symbol("▸ "),
+        list_area,
+        &mut state,
+    );
+    for (visible, index) in (state.offset()..app.listing_rows().len()).enumerate() {
+        let y = list_area.y + (visible * 3) as u16;
+        if y >= list_area.bottom() {
+            break;
+        }
+        app.operation_hit_rows.push((
+            ratatui::layout::Rect::new(
+                list_area.x,
+                y,
+                list_area.width,
+                3.min(list_area.bottom() - y),
+            ),
+            index,
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2867,7 +3314,7 @@ mod tests {
             timestamp: "2026-11-06 11:18:25".into(),
             ..Revision::default()
         };
-        let line = revision_header(&revision, "○ ", false);
+        let line = revision_header(&revision, "○ ", false, None);
         assert_eq!(
             line.to_string(),
             "○ yqkuklmm tom@ai-nc.com 2026-11-06 11:18:25 03a6cacb"
@@ -2886,7 +3333,7 @@ mod tests {
         }
         revision.working_copy = true;
         revision.empty = true;
-        let line = revision_header(&revision, "@ ", false);
+        let line = revision_header(&revision, "@ ", false, None);
         assert!(line.style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(line.spans[1].style.fg, Some(Color::LightMagenta));
         assert_eq!(
@@ -2895,7 +3342,7 @@ mod tests {
         );
         revision.root = true;
         assert_eq!(
-            revision_header(&revision, "◆ ", false).to_string(),
+            revision_header(&revision, "◆ ", false, None).to_string(),
             "◆ yqkuklmm root() 03a6cacb"
         );
         assert_eq!(
@@ -2960,7 +3407,7 @@ mod tests {
         assert_eq!(app.selection.selected(), Some(2));
         assert_eq!(press(&mut app, KeyCode::Char('g')), Effect::None);
         assert!(matches!(
-            press(&mut app, KeyCode::Char('p')),
+            press(&mut app, KeyCode::Char('i')),
             Effect::Request(_)
         ));
         assert_eq!(app.selection.selected(), Some(2));
@@ -3137,6 +3584,7 @@ mod tests {
     fn operation_fixture(count: usize) -> Vec<crate::browser::Row> {
         (0..count)
             .map(|i| crate::browser::Row {
+                bookmark: None,
                 id: format!("{i:012x}"),
                 label: format!("operation-{i}"),
                 operation: Some(crate::operations::Entry {
@@ -3296,14 +3744,14 @@ mod tests {
         let rows = rendered_rows(&mut app, 40);
         let prompt = rows
             .iter()
-            .position(|line| line.contains("Set bookmark"))
+            .position(|line| line.contains("match-on") && line.contains('▏'))
             .unwrap();
         let parent = rows
             .iter()
             .position(|line| line.contains("other") && line.contains("parent"))
             .unwrap();
-        assert!(prompt < parent && parent > parent_before);
-        assert!(rows[prompt].contains('│'));
+        assert!(prompt < parent && parent == parent_before);
+        assert!(!rows.iter().any(|line| line.contains("Set bookmark")));
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Char('r'));
         press(&mut app, KeyCode::Char('j'));
@@ -3328,6 +3776,161 @@ mod tests {
             .position(|line| line.contains("match-tw"))
             .unwrap();
         assert!(prompt < next);
+    }
+
+    #[test]
+    fn colon_input_occupies_bottom_status_line_in_every_view() {
+        for view in [
+            View::Revisions,
+            View::Files,
+            View::Bookmarks,
+            View::Git,
+            View::Operations,
+            View::Help,
+        ] {
+            let mut app = key_fixture();
+            app.view = view;
+            press(&mut app, KeyCode::Char(':'));
+            for c in "bookmark list".chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
+            let rows = rendered_rows(&mut app, 40);
+            assert!(rows.last().unwrap().starts_with(":bookmark list▏"));
+            assert!(
+                !rows[..rows.len() - 1]
+                    .iter()
+                    .any(|line| line.contains("bookmark list"))
+            );
+            assert!(!rows.iter().any(|line| line.contains("Command (:q")));
+            press(&mut app, KeyCode::Esc);
+            let rows = rendered_rows(&mut app, 40);
+            assert!(rows.last().unwrap().contains("revset:"));
+        }
+    }
+
+    #[test]
+    fn git_menu_opens_with_gi_and_filters_commands() {
+        let mut app = key_fixture();
+        assert_eq!(press(&mut app, KeyCode::Char('g')), Effect::None);
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('i')),
+            Effect::Request(crate::live::Request::Listing(
+                crate::browser::Query::GitOperations(_)
+            ))
+        ));
+        app.busy = false;
+        app.bookmark_remotes = vec!["origin".into()];
+        app.listing = ["fetch", "push"]
+            .into_iter()
+            .map(|kind| crate::browser::Row {
+                id: kind.into(),
+                label: format!("{kind} origin"),
+                operation: None,
+                bookmark: Some(crate::browser::BookmarkAction {
+                    kind: kind.into(),
+                    name: "origin".into(),
+                    remote: Some("origin".into()),
+                    local: false,
+                    args: vec![
+                        "git".into(),
+                        kind.into(),
+                        "--remote".into(),
+                        "origin".into(),
+                    ],
+                }),
+            })
+            .collect();
+        let rows = rendered_rows(&mut app, 40);
+        assert!(rows.iter().any(|line| line.contains("Git Operations")));
+        assert!(rows.iter().any(|line| line.contains("match-on")));
+        press(&mut app, KeyCode::Char('f'));
+        assert!(app.input.is_none());
+        assert_eq!(app.listing_rows().len(), 1);
+        let Effect::Request(crate::live::Request::Command(spec)) = press(&mut app, KeyCode::Enter)
+        else {
+            panic!("expected fetch");
+        };
+        assert_eq!(spec.args, ["git", "fetch", "--remote", "origin"]);
+    }
+
+    #[test]
+    fn bookmark_popup_filters_applies_and_keeps_graph_visible() {
+        let mut app = key_fixture();
+        press(&mut app, KeyCode::Char('B'));
+        assert_eq!(app.view, View::Revisions);
+        assert_eq!(app.input.as_ref().unwrap().action, "set_bookmark");
+        press(&mut app, KeyCode::Esc);
+        let effect = press(&mut app, KeyCode::Char('b'));
+        assert!(matches!(
+            effect,
+            Effect::Request(crate::live::Request::Listing(
+                crate::browser::Query::BookmarkOperations(_)
+            ))
+        ));
+        app.busy = false;
+        app.bookmark_remotes = vec!["local".into(), "origin".into()];
+        app.listing = [
+            ("move", "topic", None, true),
+            ("delete", "topic", None, true),
+            ("untrack", "topic", Some("origin"), true),
+            ("track", "remote-only", Some("origin"), false),
+        ]
+        .into_iter()
+        .map(|(kind, name, remote, local)| crate::browser::Row {
+            id: format!("{kind}:{name}"),
+            label: format!("{kind} '{name}'"),
+            operation: None,
+            bookmark: Some(crate::browser::BookmarkAction {
+                kind: kind.into(),
+                name: name.into(),
+                remote: remote.map(str::to_owned),
+                local,
+                args: vec!["bookmark".into(), kind.into(), name.into()],
+            }),
+        })
+        .collect();
+        let rows = rendered_rows(&mut app, 40);
+        assert!(rows.iter().any(|row| row.contains("Bookmark Operations")));
+        assert!(
+            rows.iter().any(|row| row.contains("match-tw")),
+            "graph remains behind the popup"
+        );
+        assert_eq!(app.listing_rows().len(), 3);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(
+            app.input.is_none(),
+            "d filters; it does not open a confirmation"
+        );
+        assert_eq!(app.listing_rows().len(), 1);
+        assert_eq!(
+            app.listing_rows()[0].bookmark.as_ref().unwrap().kind,
+            "delete"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::Bookmarks);
+        assert!(app.bookmark_category.is_empty());
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.listing_rows().len(), 2);
+        press(&mut app, KeyCode::Char('/'));
+        for key in "remote-only".chars() {
+            press(&mut app, KeyCode::Char(key));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.listing_rows().len(), 1);
+        let effect = press(&mut app, KeyCode::Enter);
+        let Effect::Request(crate::live::Request::Command(command)) = effect else {
+            panic!("expected bookmark command");
+        };
+        assert_eq!(command.args, ["bookmark", "track", "remote-only"]);
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter), Effect::None),
+            "no duplicate mutations"
+        );
+        app.pending_command = false;
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::Bookmarks);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::Revisions);
     }
 
     #[test]
