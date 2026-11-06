@@ -18,6 +18,9 @@ use std::{
 #[derive(Default)]
 struct App {
     keys: crate::keybinds::Keybinds,
+    key_sequence: Vec<KeyEvent>,
+    key_sequence_scope: String,
+    search_backwards: bool,
     input: Option<crate::input::Input>,
     target: Option<(String, Vec<String>, Vec<String>)>,
     busy: bool,
@@ -243,6 +246,7 @@ impl App {
             return Effect::None;
         }
         if self.input.is_some() {
+            self.key_sequence.clear();
             let action = self.keys.resolve("input", key);
             if action.as_deref() == Some("cancel") {
                 self.input = None;
@@ -255,9 +259,18 @@ impl App {
                         self.busy = true;
                         return Effect::Request(crate::live::Request::Revset(input.text));
                     }
-                    "search" => {
+                    "command" if matches!(input.text.trim(), "q" | "q!" | "quit" | "quit!") => {
+                        return Effect::Quit;
+                    }
+                    "command" if matches!(input.text.trim(), "help" | "h") => {
+                        self.view = View::Help;
+                        self.scroll = 0;
+                        return Effect::None;
+                    }
+                    "search" | "search_backward" => {
+                        self.search_backwards = input.action == "search_backward";
                         self.filter = input.text;
-                        self.search_match(false, true);
+                        self.search_match(self.search_backwards, true);
                         return Effect::None;
                     }
                     "file_filter" => {
@@ -286,7 +299,7 @@ impl App {
                 match action.as_deref() {
                     Some(
                         "backspace" | "delete" | "cursor_left" | "cursor_right" | "input_home"
-                        | "input_end" | "newline",
+                        | "input_end" | "newline" | "delete_word" | "delete_to_start",
                     ) => input.edit(action.as_deref().unwrap()),
                     _ => {
                         if let KeyCode::Char(c) = key.code
@@ -298,9 +311,10 @@ impl App {
                         }
                     }
                 }
-                if input.action == "search" {
+                if matches!(input.action.as_str(), "search" | "search_backward") {
+                    self.search_backwards = input.action == "search_backward";
                     self.filter = input.text.clone();
-                    self.search_match(false, true);
+                    self.search_match(self.search_backwards, true);
                 } else if input.action == "file_filter" {
                     self.file_filter = input.text.clone();
                     self.browse_index = 0;
@@ -334,9 +348,58 @@ impl App {
             View::Finder => "finder",
             _ => "view",
         };
-        let Some(action) = self.keys.resolve(scope, key) else {
-            return Effect::None;
+        if self.key_sequence_scope != scope {
+            self.key_sequence.clear();
+            self.key_sequence_scope = scope.into();
+        }
+        let pending = !self.key_sequence.is_empty();
+        if pending
+            && self
+                .keys
+                .resolve(scope, key)
+                .as_deref()
+                .is_some_and(|action| matches!(action, "cancel" | "quit"))
+        {
+            self.key_sequence.clear();
+            self.notice = None;
+            if self.keys.resolve(scope, key).as_deref() == Some("cancel") {
+                return Effect::None;
+            }
+        }
+        self.key_sequence.push(key);
+        let mut action = match self.keys.resolve_sequence(scope, &self.key_sequence) {
+            crate::keybinds::BindingMatch::Prefix => {
+                self.notice = Some("Key sequence… (Esc cancels)".into());
+                return Effect::None;
+            }
+            crate::keybinds::BindingMatch::Action(action) => action,
+            crate::keybinds::BindingMatch::None => {
+                self.key_sequence.clear();
+                if pending {
+                    self.notice = Some("Unknown key sequence".into());
+                }
+                return Effect::None;
+            }
         };
+        self.key_sequence.clear();
+        if pending {
+            self.notice = None;
+        }
+        // The event loop supplies half a screen; full-page motions use twice that.
+        let page_size = if matches!(action.as_str(), "page_down" | "page_up") {
+            page_size.saturating_mul(2)
+        } else {
+            page_size
+        };
+        action = match action.as_str() {
+            "half_page_down" => "page_down".into(),
+            "half_page_up" => "page_up".into(),
+            _ => action,
+        };
+        if matches!(action.as_str(), "next_match" | "previous_match") {
+            self.search_match(self.search_backwards ^ (action == "previous_match"), false);
+            return Effect::None;
+        }
         if action == "diff" && matches!(self.view, View::Operations | View::InlineOperations) {
             let Some(row) = self.listing.get(self.browse_index) else {
                 return Effect::None;
@@ -430,6 +493,11 @@ impl App {
             self.preview_focus = !self.preview_focus;
             return Effect::None;
         }
+        if self.preview_focus && self.preview_visible && matches!(action.as_str(), "first" | "last")
+        {
+            self.scroll = if action == "first" { 0 } else { u16::MAX };
+            return Effect::None;
+        }
         if self.preview_focus
             && self.preview_visible
             && matches!(action.as_str(), "up" | "down" | "page_up" | "page_down")
@@ -517,7 +585,7 @@ impl App {
             }
         }
         match action.as_str() {
-            "search" => {
+            "search" | "search_backward" => {
                 if self.view == View::Files || self.view == View::Finder {
                     self.start_input(
                         "file_filter",
@@ -526,7 +594,17 @@ impl App {
                         false,
                     );
                 } else {
-                    self.start_input("search", "Quick search", self.filter.clone(), false);
+                    self.search_backwards = action == "search_backward";
+                    self.start_input(
+                        &action,
+                        if self.search_backwards {
+                            "? Search backward"
+                        } else {
+                            "/ Search forward"
+                        },
+                        self.filter.clone(),
+                        false,
+                    );
                 }
                 return Effect::None;
             }
@@ -699,7 +777,12 @@ impl App {
                 return Effect::None;
             }
             "command" => {
-                self.start_input("command", "jj command (no jj log)", String::new(), false);
+                self.start_input(
+                    "command",
+                    "Command (:q quits, :help, or jj command)",
+                    String::new(),
+                    false,
+                );
                 return Effect::None;
             }
             "shell" => {
@@ -2193,7 +2276,7 @@ mod tests {
     }
 
     #[test]
-    fn navigation_uses_jjui_keys_and_modifiers() {
+    fn navigation_uses_vim_keys_and_modifiers() {
         let mut app = key_fixture();
         press(&mut app, KeyCode::Char('J'));
         assert_eq!(app.selection.selected(), Some(1));
@@ -2201,8 +2284,9 @@ mod tests {
         assert_eq!(app.selection.selected(), Some(0));
         press(&mut app, KeyCode::PageDown);
         assert_eq!(app.selection.selected(), Some(2));
+        assert_eq!(press(&mut app, KeyCode::Char('g')), Effect::None);
         assert!(matches!(
-            press(&mut app, KeyCode::Char('g')),
+            press(&mut app, KeyCode::Char('p')),
             Effect::Request(_)
         ));
         assert_eq!(app.selection.selected(), Some(2));
@@ -2212,7 +2296,7 @@ mod tests {
         assert_eq!(app.selection.selected(), Some(0));
         assert_eq!(press(&mut app, KeyCode::Char('r')), Effect::None);
         assert_eq!(
-            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL), 2),
+            app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL), 2),
             Effect::Refresh
         );
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL), 2);
@@ -2229,15 +2313,62 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.visible().len(), 3);
         assert_eq!(app.selection.selected(), Some(0));
-        press(&mut app, KeyCode::Char('\''));
+        press(&mut app, KeyCode::Char('n'));
         assert_eq!(app.selection.selected(), Some(2));
-        press(&mut app, KeyCode::Char('\''));
+        press(&mut app, KeyCode::Char('n'));
         assert_eq!(app.selection.selected(), Some(0));
-        press(&mut app, KeyCode::Char('"'));
+        press(&mut app, KeyCode::Char('N'));
         assert_eq!(app.selection.selected(), Some(2));
         press(&mut app, KeyCode::Esc);
         assert!(app.filter.is_empty());
         assert_eq!(app.selection.selected(), Some(2));
+    }
+
+    #[test]
+    fn vim_motions_search_direction_and_quit_commands() {
+        let mut app = key_fixture();
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.selection.selected(), Some(2));
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.selection.selected(), Some(2));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.key_sequence.is_empty());
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.selection.selected(), Some(0));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(
+            app.target.is_none(),
+            "an invalid sequence must not start rebase"
+        );
+        press(&mut app, KeyCode::Char('v'));
+        assert!(app.marked.contains("child"));
+        app.filter = "match".into();
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.search_backwards);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.selection.selected(), Some(2));
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(app.selection.selected(), Some(0));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL), 4);
+        assert_eq!(app.input.as_ref().unwrap().action, "redo");
+        press(&mut app, KeyCode::Esc);
+        app.view = View::Text;
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), 4);
+        assert_eq!(app.scroll, 4);
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL), 4);
+        assert_eq!(app.scroll, 12);
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), 4);
+        assert_eq!(app.scroll, 8);
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL), 4);
+        assert_eq!(app.scroll, 0);
+        press(&mut app, KeyCode::Char(':'));
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(press(&mut app, KeyCode::Enter), Effect::Quit);
+        press(&mut app, KeyCode::Char('Z'));
+        assert_eq!(press(&mut app, KeyCode::Char('Q')), Effect::Quit);
     }
 
     #[test]

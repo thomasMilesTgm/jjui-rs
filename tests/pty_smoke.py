@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
     (root / 'file.txt').write_text('base file\n')
     jj('describe', '-m', 'base')
     keys = root / '.jj/keybinds.toml'
-    keys.write_text('[revisions]\nnew=["N"]\n')
+    keys.write_text('[revisions]\nnew=["x"]\n')
 
     def snapshot():
         result = subprocess.run([binary, '-R', str(root), '--once'], env={**env, 'PATH': ''}, capture_output=True, check=True)
@@ -83,12 +83,12 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
     try:
         shown('Revisions')
         original_op = snapshot()['operation']
-        send(b'n')
+        send(b'gn')
         for _ in range(3):
             read(.1)
         assert snapshot()['operation'] == original_op, 'old binding must be disabled'
         old_commit = current()['commit_id']
-        send(b'N')
+        send(b'x')
         wait(lambda: current()['commit_id'] != old_commit, 'custom new binding did not execute')
         shown('completed')
         send(b'\r')
@@ -141,7 +141,7 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
         shown('Confirm abandon')
         send(b'\x1b')
         time.sleep(.1)
-        send(b'q')
+        send(b':q\r')
         deadline = time.monotonic() + 5
         while process.poll() is None and time.monotonic() < deadline:
             read()

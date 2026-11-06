@@ -56,6 +56,20 @@ impl Input {
                 }
             }
             "input_home" => self.cursor = 0,
+            "delete_word" => {
+                let prefix = self.text[..self.cursor].trim_end();
+                let start = prefix
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| c.is_whitespace())
+                    .map_or(0, |(i, c)| i + c.len_utf8());
+                self.text.replace_range(start..self.cursor, "");
+                self.cursor = start;
+            }
+            "delete_to_start" => {
+                self.text.replace_range(..self.cursor, "");
+                self.cursor = 0;
+            }
             "input_end" => self.cursor = self.text.len(),
             "newline" => self.insert('\n'),
             _ => {}
@@ -84,5 +98,12 @@ mod tests {
         input.edit("input_home");
         input.edit("delete");
         assert_eq!(input.text, "éz");
+        input.text = "α 😀two tail".into();
+        input.cursor = "α 😀two ".len();
+        input.edit("delete_word");
+        assert_eq!(input.text, "α tail");
+        input.edit("delete_to_start");
+        assert_eq!(input.text, "tail");
+        assert_eq!(input.cursor, 0);
     }
 }

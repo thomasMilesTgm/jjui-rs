@@ -1,6 +1,6 @@
 # jjui-rs
 
-A Rust Jujutsu TUI with an always-live commit graph, inline file details, and jjui-style bindings. Graph reads, revsets, diffs, bookmark/file listings, operation history, and automatic snapshotting use `jj-lib`. Graph refresh never runs `jj log`.
+A Rust Jujutsu TUI with an always-live commit graph, inline file details, and Vim-style bindings. Graph reads, revsets, diffs, bookmark/file listings, operation history, and automatic snapshotting use `jj-lib`. Graph refresh never runs `jj log`.
 
 ```sh
 cargo run --release -- -R /path/to/workspace
@@ -22,7 +22,7 @@ Every keyboard action is configured through `keybinds.toml`. The supplied file l
 [revisions]
 down = ["ctrl+j", "down"]
 up = ["ctrl+k", "up"]
-new = ["N"]
+new = ["x"]
 
 [global]
 quit = ["ctrl+q"]
@@ -33,7 +33,7 @@ cancel = ["esc", "left"]
 
 Scopes are `global`, `revisions`, `files`, `view`, `bookmarks`, `operations`, `finder`, `git`, and `input`. A scope-specific binding wins over a global binding. Keys are case-sensitive; `J` and `shift+j` are equivalent. Named keys include `enter`, `esc`, `space`, `tab`, arrows, `home`, `end`, `pageup`, `pagedown`, `backspace`, `delete`, and `f1`–`f12`. Modifiers can be combined, such as `ctrl+alt+x`.
 
-Unknown scopes/actions/keys, malformed TOML, and duplicate keys within a scope produce startup errors with the config path. To move a key between actions in one scope, remove it from the previous action too. Text input uses the `input` bindings; typing `q`, `n`, etc. inside an input never triggers revision commands. Help and status hints show effective bindings.
+Unknown scopes/actions/keys, malformed TOML, duplicate keys within a scope, and ambiguous sequence prefixes produce startup errors with the config path. To move a key between actions in one scope, remove it from the previous action too. Text input uses the `input` bindings; typing `q`, `n`, etc. inside an input never triggers revision commands. Help and status hints show effective bindings. Space-separated strings define key sequences: `first = ["g g", "home"]` means press `g` twice, and `focus = ["ctrl+w w", "tab"]` means Ctrl-W followed by `w`. Escape cancels a pending sequence; unmatched sequences are discarded. Prompt bindings must be single keys so typing remains literal.
 
 ```sh
 cargo run -- --check-keybinds
@@ -42,20 +42,23 @@ cargo run -- --keybinds ./custom.toml --check-keybinds
 
 ## Default workflows
 
+These defaults use Vim navigation and search while keeping domain actions such as `o`/`O` and `d`. `v` toggles marks; this is not a full Vim visual mode or text editor. New changes, Git, and evolution history use `gn`, `gp`, and `gv` to leave `n`/`N`, `gg`, and `v` available for navigation and selection.
+
 | Keys | Action |
 | --- | --- |
-| `j` / `k`, arrows; PgUp/PgDn; Home/End | Navigate |
+| `j` / `k`, arrows | Navigate |
+| `gg` / `G`, Home/End | First / last item or line |
+| Ctrl-D/U, Ctrl-F/B; PgDn/PgUp | Half-page / full-page navigation in the focused pane |
 | `@`, `J`, `K` | Working copy, parent, child |
-| `/`, `'`, `"` | Quick search, next/previous match |
-| Space | Toggle revision selection; toggle files in details |
+| `/` / `?`, `n` / `N` | Forward / backward graph search; repeat / reverse the search direction |
+| `v` / Space | Toggle revision or file marking |
 | `l` / Right | Expand files beneath the selected commit, retaining graph edges |
 | `h` / Left / Esc | Collapse files or return from a view |
 | `d` | Revision diff, or selected-file diff from inline details |
-| `p`, `P`, Tab | Toggle preview, side/bottom placement, focus |
-| Ctrl-N/P, Ctrl-D/U | Preview line/half-page scrolling |
+| `p`, `P`, Ctrl-W `w` / Tab | Toggle preview, side/bottom placement, switch focus |
 | `L` | Edit revset, evaluated by jj-lib |
-| `n` | New change from the cursor revision or marked revisions |
-| Enter, `D` | Describe inline, or in the configured external editor |
+| `gn` | New change from the cursor revision or marked revisions |
+| `i` / Enter, `D` | Describe inline, or in the configured external editor |
 | `e`, `E` | Edit revision, or open configured diff editor |
 | `r`, `S` | Rebase/squash: capture sources, navigate to destination, Enter to apply |
 | `a`, `A`, `y` | Abandon with confirmation, absorb, duplicate |
@@ -63,24 +66,26 @@ cargo run -- --keybinds ./custom.toml --check-keybinds
 | `r` in details | Restore selected files from the revision's merged parents, with confirmation |
 | `c` | Commit the current working copy with an inline description |
 | `B` | Set/move a named bookmark to the cursor revision |
-| `u`, `U` | Undo/redo with confirmation |
-| `o`, `O`, `v` | Inline operations for the focused change, full operation log, evolution history |
+| `u`, Ctrl-R | Undo/redo with confirmation |
+| `o`, `O`, `gv` | Inline operations for the focused change, full operation log, evolution history |
 | `d` in operation log | Diff the working-copy changes recorded by a snapshot operation |
 | `r` in operation log | Restore the selected operation, with confirmation |
 | `b` | Repository-wide local and remote bookmarks |
 | `d`, `t`, `u` in bookmarks | Delete local bookmark; track/untrack remote bookmark |
-| `g`, then `f` / `p` | Git remotes; fetch / push using the entered remote |
+| `gp`, then `f` / `p` | Git remotes; fetch / push using the entered remote |
 | `a` / `d` in Git view | Add / remove remote |
 | Ctrl-T | Fuzzy file finder over the selected revision's recorded tree; `/` filters and Enter opens content |
 | `:`, `$`, `W` | Explicit jj command, shell command, session command history |
 | Ctrl-S | Explicit working-copy snapshot |
-| Ctrl-R | Refresh |
-| `?` / F1 | Effective key bindings and recent file events |
-| `q` / Ctrl-C | Quit |
+| Ctrl-L | Refresh |
+| `g?` / F1 / `:help` | Effective key bindings and recent file events |
+| `:q` / `ZQ` / Ctrl-C | Quit |
 
-In prompts, Enter applies, Esc cancels, Alt-Enter inserts a newline, and Ctrl-S also applies. Descriptions and paths are passed as separate arguments, not interpolated into a shell. Only `$` deliberately runs a shell. File operations use exact, quoted workspace-relative filesets. Mutation sources use change IDs so Jujutsu's own pre-command snapshot can rewrite the working-copy commit safely.
+In prompts, Enter applies, Esc / Ctrl-[ / Ctrl-C cancels, Ctrl-H deletes backward, Ctrl-W deletes a word, Ctrl-U deletes back to the start, Alt-Enter inserts a newline, and Ctrl-S also applies. `:q` and `:help` are built-in commands available from every view; other command-prompt input is passed to jj. Descriptions and paths are passed as separate arguments, not interpolated into a shell. Only `$` deliberately runs a shell. File operations use exact, quoted workspace-relative filesets. Mutation sources use change IDs so Jujutsu's own pre-command snapshot can rewrite the working-copy commit safely.
 
 Rebase currently moves the selected revisions onto the destination; squash moves their changes into it and retains the destination description. Git push publishes bookmarks associated with the captured source revisions. Select the desired revision before opening the Git view. Use the `:` command prompt for other supported jj command flags. The prompt rejects `log`, aliases, and repository/config overrides; shell commands are explicitly user-directed.
+
+`o` expands related operations below the focused commit and pushes older commits down. `O` opens the repository-wide operation graph. Both use jj-style operation metadata, colors, curved graph edges, and a bold green `@` for the current operation. Related operations are those that change the focused change's visible commit versions, bookmark/tag references, or working-copy assignment; this follows rewrites and excludes unrelated edits. Hidden operations are contracted while retaining merge ancestry. Use `j`/`k` or the mouse to select an operation, `r` to restore it (with confirmation), and `h`/Left/Esc to close. Pressing `o` again collapses inline operations. On a snapshot operation, `d` compares its recorded working-copy trees against its actual parent operation, including added and deleted files. This shows only that snapshot’s changes, not the entire revision diff or current unsnapshotted edits. `h`/Left/Esc returns to the originating operation log and selection. Customize this key with the `diff` action in `[operations]`. These reads use `jj-lib`, without invoking `jj op log`. Bindings are configurable as `operations` and `full_operations` in `[revisions]` and `[operations]`.
 
 Click a graph row or inline file to select it. Ctrl-click toggles revision selection. The wheel moves through revisions/files. External editors temporarily restore the normal terminal and refresh the TUI when they exit.
 
@@ -114,7 +119,7 @@ Graph text follows jj's default compact log style: change ID, author email, loca
 
 ## Current limits
 
-This implements the core workflows above, not every jjui extension or advanced mode. Rebase insertion modes, annotation/range-diff views, Lua plugins, custom themes, and interactive chunk selection inside the TUI are not implemented. Interactive split/diff editing delegates to configured jj tools. Operation history shows the newest 200 operations; command history lasts for the current session. There is no mouse drag/range selection.
+This implements the core workflows above, not every jjui extension or advanced mode. Rebase insertion modes, annotation/range-diff views, Lua plugins, custom themes, and interactive chunk selection inside the TUI are not implemented. Interactive split/diff editing delegates to configured jj tools. The full operation log shows the newest 200 operations; the inline log scans history for up to 200 matching operations; command history lasts for the current session. There is no mouse drag/range selection.
 
 Text diffs use whole-file unified hunks. Binary/non-UTF-8/conflicted files and files over 256 KiB are labeled rather than rendered as text. Previews stop after 200 files or about 2 MiB of patch output with a truncation notice; renames appear as delete/add. Background command output is limited to 2 MiB and commands time out after 120 seconds. Recursive filesystem watching can require a higher OS watch limit for large workspaces. The recent-event list is best-effort and excludes `.jj`, `.git`, and `target`; it is not a complete working-copy status.
 

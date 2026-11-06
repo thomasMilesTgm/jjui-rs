@@ -6,6 +6,12 @@ use std::{
 };
 
 type Tables = BTreeMap<String, BTreeMap<String, Vec<String>>>;
+#[derive(Debug, PartialEq)]
+pub enum BindingMatch {
+    Action(String),
+    Prefix,
+    None,
+}
 #[derive(Clone, Debug)]
 pub struct Keybinds {
     tables: Tables,
@@ -63,7 +69,10 @@ impl Keybinds {
                     bail!("Unknown action {scope}.{action}");
                 }
                 for key in &keys {
-                    parse(key)?;
+                    let sequence = parse_sequence(key)?;
+                    if scope == "input" && sequence.len() != 1 {
+                        bail!("Input bindings must be a single key");
+                    }
                 }
                 target.insert(action, keys);
             }
@@ -72,11 +81,32 @@ impl Keybinds {
             let mut used = Vec::new();
             for (action, keys) in actions {
                 for key in keys {
-                    let event = parse(key)?;
+                    let event = parse_sequence(key)?;
                     if let Some((_, other)) = used.iter().find(|(k, _)| *k == event) {
                         bail!("Key {key:?} in [{scope}] is bound to both {other} and {action}");
                     }
                     used.push((event, action));
+                }
+            }
+            if scope != "global"
+                && let Some(global) = tables.get("global")
+            {
+                for (action, keys) in global {
+                    for key in keys {
+                        let sequence = parse_sequence(key)?;
+                        if !used.iter().any(|(keys, _)| *keys == sequence) {
+                            used.push((sequence, action));
+                        }
+                    }
+                }
+            }
+            for (i, (a, action)) in used.iter().enumerate() {
+                for (b, other) in used.iter().skip(i + 1) {
+                    if a.starts_with(b) || b.starts_with(a) {
+                        bail!(
+                            "Ambiguous key sequence prefix in [{scope}] between {action} and {other}"
+                        );
+                    }
                 }
             }
         }
@@ -84,14 +114,32 @@ impl Keybinds {
         Ok(())
     }
     pub fn resolve(&self, scope: &str, key: KeyEvent) -> Option<String> {
-        let key = normalize(key);
-        [scope, "global"].into_iter().find_map(|scope| {
-            self.tables
-                .get(scope)?
-                .iter()
-                .find(|(_, keys)| keys.iter().any(|s| parse(s).ok() == Some(key)))
-                .map(|(action, _)| action.clone())
-        })
+        match self.resolve_sequence(scope, &[key]) {
+            BindingMatch::Action(action) => Some(action),
+            _ => None,
+        }
+    }
+    pub fn resolve_sequence(&self, scope: &str, keys: &[KeyEvent]) -> BindingMatch {
+        let keys: Vec<_> = keys.iter().copied().map(normalize).collect();
+        let mut prefix = false;
+        for scope in [scope, "global"] {
+            if let Some(actions) = self.tables.get(scope) {
+                for (action, bindings) in actions {
+                    for binding in bindings {
+                        let sequence = parse_sequence(binding).expect("validated binding");
+                        if sequence == keys {
+                            return BindingMatch::Action(action.clone());
+                        }
+                        prefix |= sequence.starts_with(&keys);
+                    }
+                }
+            }
+        }
+        if prefix {
+            BindingMatch::Prefix
+        } else {
+            BindingMatch::None
+        }
     }
     pub fn help(&self) -> String {
         self.tables
@@ -119,6 +167,16 @@ impl Keybinds {
             .map(|keys| keys.join("/"))
             .unwrap_or_else(|| "unbound".into())
     }
+}
+fn parse_sequence(text: &str) -> Result<Vec<KeyEvent>> {
+    let keys = text
+        .split_whitespace()
+        .map(parse)
+        .collect::<Result<Vec<_>>>()?;
+    if keys.is_empty() {
+        bail!("Empty key sequence; use 'space' for a space key");
+    }
+    Ok(keys)
 }
 fn normalize(mut key: KeyEvent) -> KeyEvent {
     key.kind = crossterm::event::KeyEventKind::Press;
@@ -191,11 +249,46 @@ mod tests {
                 .as_deref(),
             Some("down")
         );
-        assert_eq!(keys.resolve("revisions", parse("n").unwrap()), None);
+        assert_eq!(
+            keys.resolve_sequence("revisions", &parse_sequence("g n").unwrap()),
+            BindingMatch::None
+        );
+        assert_eq!(
+            keys.resolve("revisions", parse("n").unwrap()).as_deref(),
+            Some("next_match")
+        );
         assert_eq!(
             keys.resolve("revisions", parse("shift+j").unwrap())
                 .as_deref(),
             Some("parent")
+        );
+    }
+    #[test]
+    fn vim_sequences_validate_and_can_be_remapped() {
+        let mut keys = Keybinds::default();
+        keys.merge("").unwrap();
+        assert_eq!(
+            keys.resolve_sequence("revisions", &parse_sequence("g").unwrap()),
+            BindingMatch::Prefix
+        );
+        assert_eq!(
+            keys.resolve_sequence("revisions", &parse_sequence("g g").unwrap()),
+            BindingMatch::Action("first".into())
+        );
+        assert_eq!(
+            keys.resolve_sequence("files", &parse_sequence("ctrl+w w").unwrap()),
+            BindingMatch::Action("focus".into())
+        );
+        assert!(keys.merge("[revisions]\nnew=['g']").is_err());
+        assert!(keys.merge("[input]\nsubmit=['g g']").is_err());
+        keys.merge("[revisions]\nfirst=['z z']").unwrap();
+        assert_eq!(
+            keys.resolve_sequence("revisions", &parse_sequence("g g").unwrap()),
+            BindingMatch::None
+        );
+        assert_eq!(
+            keys.resolve_sequence("revisions", &parse_sequence("z z").unwrap()),
+            BindingMatch::Action("first".into())
         );
     }
     #[test]
