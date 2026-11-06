@@ -36,6 +36,7 @@ impl CommandSpec {
         if !matches!(
             command.as_str(),
             "new"
+                | "workspace"
                 | "describe"
                 | "edit"
                 | "rebase"

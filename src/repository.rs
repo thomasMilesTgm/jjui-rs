@@ -28,10 +28,12 @@ pub struct Revision {
     pub change_prefix_len: usize,
     pub commit_prefix_len: usize,
     pub root: bool,
+    pub immutable: bool,
     pub empty: bool,
     pub conflict: bool,
     pub bookmarks: Vec<String>,
     pub working_copy: bool,
+    pub workspaces: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -110,6 +112,39 @@ impl Repository {
         .await
     }
 
+    pub async fn workspaces(&mut self) -> Result<Vec<crate::workspaces::Entry>> {
+        let repo = self.repo.as_ref().context("Repository not loaded")?;
+        let mut entries = Vec::new();
+        for (name, id) in repo.view().wc_commit_ids() {
+            let path = if name.as_str() == self.workspace.workspace_name().as_str() {
+                Some(self.root())
+            } else {
+                repo.loader().workspace_store().get_workspace_path(name)?
+            };
+            let commit = repo.store().get_commit_async(id).await?;
+            entries.push(crate::workspaces::Entry {
+                name: name.as_str().into(),
+                current: name.as_str() == self.workspace.workspace_name().as_str(),
+                available: path.as_ref().is_some_and(|p| p.join(".jj").is_dir()),
+                path,
+                commit: id.hex(),
+                description: commit.description().lines().next().unwrap_or("").into(),
+            });
+        }
+        Ok(entries)
+    }
+
+    pub fn reload_workspace(&mut self) -> Result<()> {
+        let root = self.root();
+        self.workspace = Workspace::load(
+            &crate::settings::load(&root)?,
+            &root,
+            &default_backend_factories(),
+            &default_working_copy_factories(),
+        )?;
+        Ok(())
+    }
+
     pub fn root(&self) -> PathBuf {
         self.workspace.workspace_root().to_owned()
     }
@@ -150,6 +185,14 @@ impl Repository {
                 &self.revset
             },
         )?;
+        let immutable = evaluate_revset(
+            repo.as_ref(),
+            self.workspace.settings(),
+            &self.root(),
+            self.workspace.workspace_name(),
+            "immutable()",
+        )?;
+        let is_immutable = immutable.containing_fn();
         let mut revisions = Vec::new();
         let mut stream = revset.stream().take(self.limit);
         while let Some(id) = stream.next().await {
@@ -180,10 +223,21 @@ impl Repository {
                     .shortest_unique_commit_id_prefix_len(&id)
                     .await?,
                 root: id == *repo.store().root_commit_id(),
+                immutable: is_immutable(&id).await?,
                 empty: commit.is_empty(repo.as_ref()).await?,
                 conflict: commit.has_conflict(),
                 bookmarks,
                 working_copy: wc == Some(&id),
+                workspaces: if repo.view().wc_commit_ids().len() > 1 {
+                    repo.view()
+                        .wc_commit_ids()
+                        .iter()
+                        .filter(|(_, commit)| *commit == &id)
+                        .map(|(name, _)| format!("{}@", name.as_str()))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             });
         }
         self.repo = Some(repo.clone());

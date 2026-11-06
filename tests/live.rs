@@ -491,3 +491,37 @@ fn secure_repo_and_workspace_config_are_loaded_without_migration() {
     }
     assert_eq!(heads(temp.path()), before);
 }
+
+#[test]
+fn immutable_flags_follow_configured_heads_without_running_jj() {
+    let temp = fixture();
+    jj(temp.path(), &["bookmark", "create", "published"]);
+    jj(temp.path(), &["new", "-m", "mutable child"]);
+    std::fs::write(
+        temp.path().join(".jj/repo/config.toml"),
+        "[revset-aliases]\n'immutable_heads()' = 'bookmarks(published)'\n",
+    )
+    .unwrap();
+    let before = heads(temp.path());
+    let output = viewer(temp.path()).arg("--once").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let revisions = snapshot["revisions"].as_array().unwrap();
+    assert!(revisions.iter().any(|r| {
+        r["description"]
+            .as_str()
+            .unwrap()
+            .contains("first revision")
+            && r["immutable"] == true
+    }));
+    assert!(
+        revisions
+            .iter()
+            .any(|r| r["working_copy"] == true && r["immutable"] == false)
+    );
+    assert_eq!(heads(temp.path()), before);
+}

@@ -2,6 +2,7 @@ mod bookmarks;
 mod browser;
 mod chunks;
 mod commands;
+mod elision;
 mod graph;
 mod input;
 mod keybinds;
@@ -14,6 +15,7 @@ mod settings;
 mod snapshot;
 mod theme;
 mod ui;
+mod workspaces;
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -153,6 +155,9 @@ fn main() -> Result<()> {
     if args.watch_json {
         for update in &live.updates {
             let value = match update {
+                live::Update::Workspaces(result) => {
+                    serde_json::json!({"type":"workspaces","result":result})
+                }
                 live::Update::PluginFinished(result) => {
                     serde_json::json!({"type":"plugin","result":result})
                 }
@@ -187,6 +192,6 @@ fn main() -> Result<()> {
         }
         Ok(())
     } else {
-        ui::run(live, keys, theme, args.theme, plugins)
+        ui::run(live, keys, theme, args.theme, plugins, args.keybinds)
     }
 }

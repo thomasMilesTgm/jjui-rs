@@ -10,6 +10,7 @@ use std::{
 
 #[derive(Debug, PartialEq)]
 pub enum Request {
+    Workspaces,
     Plugin(crate::plugins::Task),
     Chunks { id: String, path: String },
     ApplyChunks(crate::chunks::Request),
@@ -20,6 +21,7 @@ pub enum Request {
 }
 
 pub enum Update {
+    Workspaces(Result<Vec<crate::workspaces::Entry>, String>),
     PluginFinished(Result<String, String>),
     Chunks {
         id: String,
@@ -46,6 +48,9 @@ pub enum Update {
 }
 
 pub struct Live {
+    pub repo_path: PathBuf,
+    pub limit: usize,
+    pub auto_snapshot: bool,
     pub updates: Receiver<Update>,
     pub tasks: SyncSender<Request>,
     pub root: PathBuf,
@@ -148,6 +153,16 @@ pub fn start(
             }
             if let Ok(request) = task_requests.try_recv() {
                 let update = match request {
+                    Request::Workspaces => {
+                        let result = (|| -> anyhow::Result<_> {
+                            repo.reload_workspace()?;
+                            if let Some(snapshot) = runtime.block_on(repo.refresh(true))? {
+                                let _ = send.send(Update::Repository(snapshot));
+                            }
+                            runtime.block_on(repo.workspaces())
+                        })();
+                        Update::Workspaces(result.map_err(|e| format!("{e:#}")))
+                    }
                     Request::Chunks { id, path } => Update::Chunks {
                         result: runtime
                             .block_on(repo.chunks(&id, &path))
@@ -238,6 +253,11 @@ pub fn start(
                     Request::Command(spec) => {
                         let result =
                             crate::commands::execute(&root, &spec).map_err(|e| format!("{e:#}"));
+                        if spec.args.first().is_some_and(|arg| arg == "workspace")
+                            && let Err(error) = repo.reload_workspace()
+                        {
+                            let _ = send.send(Update::Error(format!("{error:#}")));
+                        }
                         force = true;
                         Update::CommandFinished {
                             command: spec.display(),
@@ -284,6 +304,9 @@ pub fn start(
         }
     });
     Ok(Live {
+        repo_path: metadata,
+        limit,
+        auto_snapshot,
         updates,
         root: live_root,
         initial_revset,

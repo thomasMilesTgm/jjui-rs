@@ -30,6 +30,8 @@ preview_page_up = ["ctrl+u"]
 
 # jjui: n new, v evolution, g Git, o full operation log, Space select, U redo.
 [revisions]
+# jjui-rs workspace menu (g is used by Git in this preset).
+workspaces = ["ctrl+w"]
 down = ["j", "down"]
 up = ["k", "up"]
 page_down = ["pagedown"]
@@ -210,3 +212,15 @@ restore = ["r"]
 split = ["s"]
 cancel = ["h", "left", "esc"]
 
+
+[elision]
+workspaces = ["ctrl+w"]
+first = ["home"]
+last = ["end"]
+page_down = ["pagedown"]
+page_up = ["pageup"]
+half_page_down = []
+half_page_up = []
+search_backward = []
+next_match = ["'"]
+previous_match = ['"']

@@ -29,8 +29,10 @@ working-tree edits through `jj-lib`. Editing and Git commands still use the `jj`
 
 ## Features
 
+- Expandable immutable-history rows in the live graph.
 - Inline files, diffs, operation history, and action prompts.
 - Bookmark and Git menus, with local/remote divergence markers.
+- Workspace switching, creation, renaming, forgetting, removal, and stale-workspace updates.
 - Hunk restore and split, with checks for intervening edits.
 - Configurable themes and contextual keybinding hints.
 

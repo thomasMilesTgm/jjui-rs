@@ -1,3 +1,4 @@
+mod workspaces;
 use crate::{
     live::{Live, Update},
     repository::Snapshot,
@@ -17,6 +18,10 @@ use std::{
 
 #[derive(Default)]
 struct App {
+    workspace_menu: Option<workspaces::Menu>,
+    full_snapshot: Option<Snapshot>,
+    expanded_immutable: HashSet<String>,
+    hidden_immutable: std::collections::HashMap<String, Vec<String>>,
     keys: crate::keybinds::Keybinds,
     repository_path: String,
     plugin_session: Option<crate::plugins::Session>,
@@ -111,6 +116,7 @@ struct OperationDiff {
 
 #[derive(Debug, PartialEq)]
 enum Effect {
+    SwitchWorkspace(std::path::PathBuf),
     ReloadTheme,
     None,
     Quit,
@@ -121,7 +127,72 @@ enum Effect {
 }
 
 impl App {
+    fn selected_elision(&self) -> Option<&Vec<String>> {
+        let revision = self
+            .snapshot
+            .as_ref()?
+            .revisions
+            .get(self.selection.selected()?)?;
+        self.hidden_immutable.get(&revision.commit_id)
+    }
+    fn expand_immutable(&mut self) {
+        if let Some(ids) = self.selected_elision().cloned() {
+            self.expanded_immutable = ids.into_iter().collect();
+            if let Some(snapshot) = self.full_snapshot.clone() {
+                self.update(snapshot);
+            }
+            self.view = View::Revisions;
+            self.notice = None;
+        }
+    }
+    fn collapse_immutable(&mut self) {
+        if self.expanded_immutable.is_empty() {
+            return;
+        }
+        let focused = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                self.selection
+                    .selected()
+                    .and_then(|index| snapshot.revisions.get(index))
+            })
+            .map(|r| r.commit_id.clone());
+        self.expanded_immutable.clear();
+        if let Some(snapshot) = self.full_snapshot.clone() {
+            self.update(snapshot);
+        }
+        if let Some(focused) = focused
+            && let Some((head, _)) = self
+                .hidden_immutable
+                .iter()
+                .find(|(_, ids)| ids.contains(&focused))
+        {
+            let index = self
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .revisions
+                .iter()
+                .position(|r| &r.commit_id == head);
+            self.selection.select(index);
+        }
+        self.notice = None;
+    }
+    fn collapse_unfocused_immutable(&mut self) {
+        if !self.expanded_immutable.is_empty()
+            && !self
+                .selected_id()
+                .is_some_and(|id| self.expanded_immutable.contains(id))
+        {
+            self.collapse_immutable();
+        }
+    }
     fn start_plugin(&mut self, name: &str) {
+        if self.selected_elision().is_some() {
+            self.notice = Some("Expand immutable revisions first".into());
+            return;
+        }
         if self.plugin_session.is_some() || self.pending_command {
             self.notice = Some("An action is still running".into());
             return;
@@ -285,10 +356,14 @@ impl App {
             .as_ref()?
             .revisions
             .get(self.selection.selected()?)
+            .filter(|r| !self.hidden_immutable.contains_key(&r.commit_id))
             .map(|r| r.commit_id.as_str())
     }
 
     fn preview_text(&self) -> String {
+        if self.selected_elision().is_some() {
+            return "Expand immutable revisions to view a diff".into();
+        }
         if let Some(error) = &self.preview_error {
             return format!("Cannot load diff: {error}");
         }
@@ -428,7 +503,65 @@ impl App {
             Effect::Request(crate::live::Request::Command(spec))
         }
     }
+    fn binding_action(&mut self, scope: &str, key: KeyEvent) -> Option<String> {
+        if self.key_sequence_scope != scope {
+            self.key_sequence.clear();
+            self.key_sequence_scope = scope.into();
+        }
+        let pending = !self.key_sequence.is_empty();
+        if pending
+            && self
+                .keys
+                .resolve(scope, key)
+                .as_deref()
+                .is_some_and(|action| matches!(action, "cancel" | "quit"))
+        {
+            self.key_sequence.clear();
+            self.notice = None;
+            if self.keys.resolve(scope, key).as_deref() == Some("cancel") {
+                return None;
+            }
+        }
+        self.key_sequence.push(key);
+        let action = match self.keys.resolve_sequence(scope, &self.key_sequence) {
+            crate::keybinds::BindingMatch::Prefix => {
+                self.notice = Some("Key sequence… (Esc cancels)".into());
+                return None;
+            }
+            crate::keybinds::BindingMatch::Action(action) => action,
+            crate::keybinds::BindingMatch::None => {
+                self.key_sequence.clear();
+                if pending {
+                    self.notice = Some("Unknown key sequence".into());
+                }
+                return None;
+            }
+        };
+        self.key_sequence.clear();
+        if pending {
+            self.notice = None;
+        }
+        Some(action)
+    }
     fn handle_key(&mut self, key: KeyEvent, page_size: usize) -> Effect {
+        if key.kind != KeyEventKind::Release
+            && self.view == View::Revisions
+            && self.input.is_none()
+            && self.target.is_none()
+            && self.workspace_menu.is_none()
+            && self.plugin_choice.is_none()
+            && self.key_sequence.is_empty()
+            && !self.expanded_immutable.is_empty()
+            && self.keys.resolve("revisions", key).as_deref() == Some("cancel")
+        {
+            self.collapse_immutable();
+            return Effect::None;
+        }
+        let effect = self.handle_key_inner(key, page_size);
+        self.collapse_unfocused_immutable();
+        effect
+    }
+    fn handle_key_inner(&mut self, key: KeyEvent, page_size: usize) -> Effect {
         if key.kind == KeyEventKind::Release {
             return Effect::None;
         }
@@ -459,6 +592,9 @@ impl App {
                 _ => {}
             }
             return Effect::None;
+        }
+        if self.workspace_menu.is_some() && self.input.is_none() {
+            return self.workspace_key(key, page_size);
         }
         if self.input.is_some() {
             self.key_sequence.clear();
@@ -528,11 +664,17 @@ impl App {
                     self.browse_index = 0;
                 }
                 self.input = None;
+                if let Some(menu) = &mut self.workspace_menu {
+                    menu.pending = None;
+                }
                 self.pending_chunk = None;
                 return Effect::None;
             }
             if matches!(action.as_deref(), Some("submit" | "accept")) {
                 let input = self.input.take().unwrap();
+                if input.action.starts_with("workspace_") {
+                    return self.workspace_submit(input);
+                }
                 match input.action.as_str() {
                     "plugin_prompt" => {
                         self.resume_plugin(crate::plugins::Response {
@@ -628,7 +770,10 @@ impl App {
             }
             return Effect::None;
         }
-        if self.target.is_some() && self.keys.resolve("input", key).as_deref() == Some("submit") {
+        if self.target.is_some()
+            && self.selected_elision().is_none()
+            && self.keys.resolve("input", key).as_deref() == Some("submit")
+        {
             let (action, sources, files) = self.target.clone().unwrap();
             if let Some(destination) = self.sources().first() {
                 // Use the cursor, not the marked source set, as the destination.
@@ -645,52 +790,33 @@ impl App {
             }
             return Effect::None;
         }
-        let scope = match self.view {
-            View::Revisions => "revisions",
-            View::Files => "files",
-            View::Chunks => "chunks",
-            View::Bookmarks => "bookmarks",
-            View::Operations | View::InlineOperations => "operations",
-            View::Git => "git",
-            View::Finder => "finder",
-            _ => "view",
-        };
-        if self.key_sequence_scope != scope {
-            self.key_sequence.clear();
-            self.key_sequence_scope = scope.into();
-        }
-        let pending = !self.key_sequence.is_empty();
-        if pending
-            && self
-                .keys
-                .resolve(scope, key)
-                .as_deref()
-                .is_some_and(|action| matches!(action, "cancel" | "quit"))
-        {
-            self.key_sequence.clear();
-            self.notice = None;
-            if self.keys.resolve(scope, key).as_deref() == Some("cancel") {
-                return Effect::None;
-            }
-        }
-        self.key_sequence.push(key);
-        let mut action = match self.keys.resolve_sequence(scope, &self.key_sequence) {
-            crate::keybinds::BindingMatch::Prefix => {
-                self.notice = Some("Key sequence… (Esc cancels)".into());
-                return Effect::None;
-            }
-            crate::keybinds::BindingMatch::Action(action) => action,
-            crate::keybinds::BindingMatch::None => {
-                self.key_sequence.clear();
-                if pending {
-                    self.notice = Some("Unknown key sequence".into());
-                }
-                return Effect::None;
+        let scope = if self.selected_elision().is_some()
+            && matches!(
+                self.view,
+                View::Revisions | View::InlineOperations | View::Files
+            ) {
+            "elision"
+        } else {
+            match self.view {
+                View::Revisions => "revisions",
+                View::Files => "files",
+                View::Chunks => "chunks",
+                View::Bookmarks => "bookmarks",
+                View::Operations | View::InlineOperations => "operations",
+                View::Git => "git",
+                View::Finder => "finder",
+                _ => "view",
             }
         };
-        self.key_sequence.clear();
-        if pending {
-            self.notice = None;
+        let Some(mut action) = self.binding_action(scope, key) else {
+            return Effect::None;
+        };
+        if action == "expand" {
+            self.expand_immutable();
+            return Effect::None;
+        }
+        if scope == "elision" {
+            self.view = View::Revisions;
         }
         // The event loop supplies half a screen; full-page motions use twice that.
         let page_size = if matches!(action.as_str(), "page_down" | "page_up") {
@@ -1224,6 +1350,14 @@ impl App {
                 self.busy = true;
                 return Effect::Request(crate::live::Request::Listing(query));
             }
+            "workspaces" => {
+                if self.pending_command || self.plugin_session.is_some() {
+                    self.notice = Some("An action is still running".into());
+                    return Effect::None;
+                }
+                self.workspace_menu = Some(workspaces::Menu::default());
+                return Effect::Request(crate::live::Request::Workspaces);
+            }
             "bookmarks" => {
                 let Some(id) = self.selected_id().map(str::to_owned) else {
                     return Effect::None;
@@ -1421,6 +1555,10 @@ impl App {
             .unwrap_or_default()
     }
     fn mouse(&mut self, mouse: event::MouseEvent) {
+        self.mouse_inner(mouse);
+        self.collapse_unfocused_immutable();
+    }
+    fn mouse_inner(&mut self, mouse: event::MouseEvent) {
         if self.input.is_some() {
             return;
         }
@@ -1798,6 +1936,16 @@ impl App {
     }
 
     fn update(&mut self, snapshot: Snapshot) {
+        self.full_snapshot = Some(snapshot.clone());
+        self.expanded_immutable
+            .retain(|id| snapshot.revisions.iter().any(|r| &r.commit_id == id));
+        let (revisions, hidden) =
+            crate::elision::collapse(&snapshot.revisions, &self.expanded_immutable, &self.marked);
+        let snapshot = Snapshot {
+            operation: snapshot.operation,
+            revisions,
+        };
+        self.hidden_immutable = hidden;
         let visible = self.visible();
         let old = self
             .selection
@@ -1855,12 +2003,14 @@ impl App {
 }
 
 pub fn run(
-    live: Live,
+    mut live: Live,
     keys: crate::keybinds::Keybinds,
     theme: crate::theme::Theme,
     theme_choice: Option<String>,
     plugin_config: crate::plugins::Config,
+    keybinds_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
+    let plugin_names = plugin_config.names();
     let plugins = crate::plugins::Worker::start(plugin_config)?;
     let mut terminal = ratatui::init();
     crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
@@ -1875,7 +2025,18 @@ pub fn run(
             revset: live.initial_revset.clone(),
             ..App::default()
         };
+        let mut workspace_check = std::time::Instant::now();
         loop {
+            if app.workspace_menu.is_some()
+                && !app.pending_command
+                && workspace_check.elapsed() >= Duration::from_secs(2)
+                && live
+                    .tasks
+                    .try_send(crate::live::Request::Workspaces)
+                    .is_ok()
+            {
+                workspace_check = std::time::Instant::now();
+            }
             loop {
                 match plugins.results.try_recv() {
                     Ok(result) => {
@@ -1902,6 +2063,22 @@ pub fn run(
             }
             for update in live.updates.try_iter() {
                 match update {
+                    Update::Workspaces(result) => match result {
+                        Ok(entries) => {
+                            if let Some(menu) = &mut app.workspace_menu {
+                                let selected =
+                                    menu.entries.get(menu.index).map(|entry| entry.name.clone());
+                                menu.index = selected
+                                    .and_then(|name| {
+                                        entries.iter().position(|entry| entry.name == name)
+                                    })
+                                    .or_else(|| entries.iter().position(|entry| entry.current))
+                                    .unwrap_or(0);
+                                menu.entries = entries;
+                            }
+                        }
+                        Err(error) => app.error = Some(error),
+                    },
                     Update::PluginFinished(result) => {
                         app.busy = false;
                         app.pending_command = false;
@@ -1996,6 +2173,9 @@ pub fn run(
                         }
                     }
                     Update::CommandFinished { command, result } => {
+                        if command.starts_with("jj workspace ") && app.workspace_menu.is_some() {
+                            let _ = live.tasks.try_send(crate::live::Request::Workspaces);
+                        }
                         app.busy = false;
                         app.pending_command = false;
                         match result {
@@ -2059,6 +2239,7 @@ pub fn run(
                 }
             }
             let plugin_effect = app.next_plugin_effect();
+            app.collapse_unfocused_immutable();
             terminal.draw(|frame| draw(frame, &mut app))?;
             let effect = if let Some(effect) = plugin_effect {
                 effect
@@ -2069,7 +2250,8 @@ pub fn run(
                 let key = match event::read()? {
                     Event::Key(key) => key,
                     Event::Mouse(mouse) => {
-                        if app.plugin_choice.is_none()
+                        if app.workspace_menu.is_none()
+                            && app.plugin_choice.is_none()
                             && !app
                                 .input
                                 .as_ref()
@@ -2085,6 +2267,47 @@ pub fn run(
                 app.handle_key(key, page_size)
             };
             match effect {
+                Effect::SwitchWorkspace(path) => {
+                    let next = (|| -> Result<_> {
+                        let target = crate::repository::Repository::open(&path, live.limit)?;
+                        anyhow::ensure!(
+                            target.repo_path().canonicalize()? == live.repo_path.canonicalize()?,
+                            "Workspace no longer belongs to this repository"
+                        );
+                        let keys = crate::keybinds::Keybinds::load_with_plugins(
+                            &path,
+                            keybinds_path.as_deref(),
+                            &plugin_names,
+                        )?;
+                        let theme = crate::theme::Theme::load(&path, theme_choice.as_deref())?;
+                        let next = crate::live::start(
+                            path,
+                            live.limit,
+                            live.auto_snapshot,
+                            app.revset.clone(),
+                        )?;
+                        Ok((next, keys, theme))
+                    })();
+                    match next {
+                        Ok((next, keys, theme)) => {
+                            let history = std::mem::take(&mut app.history);
+                            app = App {
+                                keys,
+                                theme,
+                                history,
+                                repository_path: next.root.display().to_string(),
+                                revset: next.initial_revset.clone(),
+                                notice: Some(format!("Switched to {}", next.root.display())),
+                                follow_working_copy: true,
+                                ..App::default()
+                            };
+                            live = next;
+                        }
+                        Err(error) => {
+                            app.error = Some(format!("Cannot switch workspace: {error:#}"))
+                        }
+                    }
+                }
                 Effect::ReloadTheme => {
                     match crate::theme::Theme::load(&live.root, theme_choice.as_deref()) {
                         Ok(theme) => {
@@ -2215,7 +2438,15 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     app.hit_rows.clear();
     app.operation_hit_rows.clear();
     app.chunk_hit_rows.clear();
+    let workspace_input = if app.workspace_menu.is_some() {
+        app.input.take()
+    } else {
+        None
+    };
     draw_body(frame, app);
+    if app.workspace_menu.is_some() {
+        app.input = workspace_input;
+    }
     let inline = match app.view {
         View::Revisions | View::Files | View::InlineOperations => app.selected_id().is_some(),
         View::Chunks => {
@@ -2231,6 +2462,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     };
     if let Some(input) = &app.input
         && !inline
+        && app.workspace_menu.is_none()
         && input.action != "command"
     {
         let area = frame.area();
@@ -2296,10 +2528,26 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             &mut state,
         );
     }
+    if app.workspace_menu.is_some() {
+        workspaces::draw(frame, app);
+        let area = frame.area();
+        frame.render_widget(
+            Paragraph::new(footer_hints(app, area.width as usize)),
+            ratatui::layout::Rect::new(
+                area.x,
+                area.y + area.height.saturating_sub(2),
+                area.width,
+                area.height.min(1),
+            ),
+        );
+    }
     app.theme.apply(frame.buffer_mut());
 }
 
 fn footer_mode(app: &App) -> &'static str {
+    if app.workspace_menu.is_some() {
+        return "Workspaces";
+    }
     if app.input.is_some() {
         return "Input";
     }
@@ -2326,6 +2574,52 @@ fn footer_mode(app: &App) -> &'static str {
 }
 
 fn footer_hints(app: &App, width: usize) -> Line<'static> {
+    if app.workspace_menu.is_some() {
+        if app.input.is_none()
+            && !app.key_sequence.is_empty()
+            && app.key_sequence_scope == "workspaces"
+        {
+            return render_footer_hints(
+                app,
+                width,
+                app.keys
+                    .continuations("workspaces", &app.key_sequence)
+                    .into_iter()
+                    .map(|(key, action)| {
+                        (
+                            key,
+                            action.trim_start_matches("workspace_").replace('_', " "),
+                        )
+                    }),
+            );
+        }
+        let (scope, hints): (&str, &[(&str, &str)]) = if app.input.is_some() {
+            ("input", &[("submit", "apply"), ("cancel", "cancel")])
+        } else {
+            (
+                "workspaces",
+                &[
+                    ("workspace_switch", "switch"),
+                    ("workspace_add", "add"),
+                    ("workspace_rename", "rename current"),
+                    ("workspace_forget", "forget"),
+                    ("workspace_remove", "remove directory"),
+                    ("workspace_update", "update stale"),
+                    ("cancel", "back"),
+                ],
+            )
+        };
+        return render_footer_hints(
+            app,
+            width,
+            hints.iter().filter_map(|(action, label)| {
+                app.keys
+                    .hint(scope, action)
+                    .map(|key| (key, (*label).into()))
+            }),
+        );
+    }
+
     if app.plugin_choice.is_some() {
         return render_footer_hints(
             app,
@@ -2345,15 +2639,23 @@ fn footer_hints(app: &App, width: usize) -> Line<'static> {
         );
     }
 
-    let scope = match app.view {
-        View::Revisions => "revisions",
-        View::Files => "files",
-        View::Chunks => "chunks",
-        View::Operations | View::InlineOperations => "operations",
-        View::Bookmarks => "bookmarks",
-        View::Finder => "finder",
-        View::Git => "git",
-        _ => "view",
+    let scope = if app.selected_elision().is_some()
+        && matches!(
+            app.view,
+            View::Revisions | View::InlineOperations | View::Files
+        ) {
+        "elision"
+    } else {
+        match app.view {
+            View::Revisions => "revisions",
+            View::Files => "files",
+            View::Chunks => "chunks",
+            View::Operations | View::InlineOperations => "operations",
+            View::Bookmarks => "bookmarks",
+            View::Finder => "finder",
+            View::Git => "git",
+            _ => "view",
+        }
     };
     if app.input.is_none() && !app.key_sequence.is_empty() && app.key_sequence_scope == scope {
         let mut hints: Vec<_> = app
@@ -2384,6 +2686,13 @@ fn footer_hints(app: &App, width: usize) -> Line<'static> {
         return render_footer_hints(app, width, hints);
     }
     let mut hints: Vec<(&str, &str, &str)> = Vec::new();
+    if app.view == View::Revisions
+        && app.input.is_none()
+        && app.target.is_none()
+        && !app.expanded_immutable.is_empty()
+    {
+        hints.push(("revisions", "cancel", "hide immutable commits"));
+    }
     if let Some(input) = &app.input {
         hints.extend([
             (
@@ -2406,6 +2715,14 @@ fn footer_hints(app: &App, width: usize) -> Line<'static> {
                 ("input", "newline", "newline"),
             ]);
         }
+    } else if scope == "elision" {
+        hints.extend([
+            ("elision", "expand", "show hidden commits"),
+            ("elision", "down", "down"),
+            ("elision", "up", "up"),
+            ("elision", "working_copy", "working copy"),
+            ("global", "help", "help"),
+        ]);
     } else if app.target.is_some() {
         hints.extend([
             ("revisions", "down", "next destination"),
@@ -2893,6 +3210,12 @@ fn revision_header(
         ));
         spans.push(Span::raw(" "));
     }
+    for workspace in &revision.workspaces {
+        spans.push(Span::styled(
+            format!("{workspace} "),
+            Style::default().fg(Color::Green),
+        ));
+    }
     spans.extend(log_id(
         &revision.commit_id,
         revision.commit_prefix_len,
@@ -3154,6 +3477,45 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
             };
             if selected {
                 selected_row = Some(items.len());
+            }
+            if let Some(hidden) = app.hidden_immutable.get(&revision.commit_id) {
+                targets.push((i, None));
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(
+                        graph.node.replace('○', "~"),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{} immutable revision{}",
+                            hidden.len(),
+                            if hidden.len() == 1 { "" } else { "s" }
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        if revision.bookmarks.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {}", revision.bookmarks.join(" "))
+                        },
+                        Style::default().fg(Color::Magenta),
+                    ),
+                ])));
+                if graph.edge.chars().any(|c| !matches!(c, ' ' | '│')) {
+                    targets.push((i, None));
+                    items.push(ListItem::new(Line::styled(
+                        graph.edge.clone(),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+                if let Some(boundary) = &graph.boundary {
+                    targets.push((i, None));
+                    items.push(ListItem::new(format!(
+                        "{boundary} ancestors outside loaded history"
+                    )));
+                }
+                continue;
             }
             targets.push((i, None));
             let mut header = revision_header(
@@ -3670,6 +4032,102 @@ mod tests {
             working_copy: false,
             ..Revision::default()
         }
+    }
+
+    #[test]
+    fn immutable_rows_expand_in_place_and_remain_expanded_after_refresh() {
+        let snapshot = Snapshot {
+            operation: "op".into(),
+            revisions: vec![
+                Revision {
+                    working_copy: true,
+                    parents: vec!["a".into()],
+                    ..revision("work", "work")
+                },
+                Revision {
+                    immutable: true,
+                    parents: vec!["b".into()],
+                    description: "hidden newest".into(),
+                    ..revision("a", "alpha")
+                },
+                Revision {
+                    immutable: true,
+                    parents: vec!["root".into()],
+                    description: "hidden oldest".into(),
+                    ..revision("b", "beta")
+                },
+                Revision {
+                    immutable: true,
+                    root: true,
+                    ..revision("root", "root")
+                },
+            ],
+        };
+        let mut app = App::default();
+        app.update(snapshot.clone());
+        assert_eq!(app.snapshot.as_ref().unwrap().revisions.len(), 3);
+        let rows = rendered_rows(&mut app, 30);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("~ 2 immutable revisions"))
+        );
+        assert!(!rows.iter().any(|row| row.contains("hidden oldest")));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(app.selected_id().is_none());
+        assert!(
+            footer_hints(&app, 200)
+                .to_string()
+                .contains("enter show hidden commits")
+        );
+        assert_eq!(press(&mut app, KeyCode::Char('a')), Effect::None);
+        assert!(app.input.is_none());
+        assert_eq!(press(&mut app, KeyCode::Enter), Effect::None);
+        assert!(app.input.is_none());
+        assert_eq!(app.selected_id(), Some("a"));
+        assert_eq!(app.snapshot.as_ref().unwrap().revisions.len(), 4);
+        press(&mut app, KeyCode::Char('j'));
+        app.update(snapshot);
+        assert_eq!(app.selected_id(), Some("b"));
+        assert!(app.hidden_immutable.is_empty());
+        assert!(
+            rendered_rows(&mut app, 30)
+                .iter()
+                .any(|row| row.contains("hidden oldest"))
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.selected_elision().is_some());
+        assert!(app.expanded_immutable.is_empty());
+        assert_eq!(app.selection.selected(), Some(1));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.selected_id(), Some("b"));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.selected_id(), Some("root"));
+        assert!(app.expanded_immutable.is_empty());
+        assert_eq!(app.snapshot.as_ref().unwrap().revisions.len(), 3);
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.selected_id(), Some("work"));
+        assert!(app.expanded_immutable.is_empty());
+    }
+
+    #[test]
+    fn folded_rebase_destination_expands_before_submitting_and_supports_custom_keys() {
+        let mut app = key_fixture();
+        let mut snapshot = app.full_snapshot.clone().unwrap();
+        snapshot.revisions[1].immutable = true;
+        app.update(snapshot);
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(app.selected_elision().is_some());
+        app.keys.merge("[elision]\nexpand=['x']\n").unwrap();
+        assert_eq!(press(&mut app, KeyCode::Enter), Effect::None);
+        assert!(app.selected_elision().is_some());
+        assert_eq!(press(&mut app, KeyCode::Char('x')), Effect::None);
+        assert!(app.selected_elision().is_none());
+        assert!(app.target.is_some());
+        assert!(!app.pending_command);
     }
 
     #[test]
