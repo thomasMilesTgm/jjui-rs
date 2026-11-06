@@ -1298,7 +1298,11 @@ impl App {
                 ));
                 return Effect::None;
             }
-            "abandon" | "restore" | "undo" | "redo" => {
+            "undo" => {
+                self.start_input("undo", "Confirm undo", String::new(), true);
+                return Effect::None;
+            }
+            "abandon" | "restore" | "redo" => {
                 self.start_input(
                     &action,
                     &format!("Confirm {action} for {} revision(s)", self.sources().len()),
@@ -2403,7 +2407,7 @@ fn prompt_lines(app: &App, prefix: &str, width: usize) -> Vec<Line<'static>> {
     };
     if matches!(
         input.action.as_str(),
-        "set_bookmark" | "command" | "abandon"
+        "set_bookmark" | "command" | "abandon" | "undo"
     ) {
         return Vec::new();
     }
@@ -2478,7 +2482,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     if let Some(input) = &app.input
         && !inline
         && app.workspace_menu.is_none()
-        && !matches!(input.action.as_str(), "command" | "abandon")
+        && !matches!(input.action.as_str(), "command" | "abandon" | "undo")
     {
         let area = frame.area();
         let height = area.height.saturating_sub(2).min(9);
@@ -2554,6 +2558,43 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 area.width,
                 area.height.min(1),
             ),
+        );
+    }
+    if app
+        .input
+        .as_ref()
+        .is_some_and(|input| input.action == "undo")
+    {
+        let area = frame.area();
+        let width = area.width.saturating_sub(4).min(68);
+        let height = area.height.saturating_sub(4).min(7);
+        let popup = ratatui::layout::Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(ratatui::widgets::Clear, popup);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::raw("Undo the last operation in this repository?"),
+                Line::raw("This applies to repository history, not just the selected commit."),
+                Line::raw(""),
+                render_footer_hints(
+                    app,
+                    width.saturating_sub(2) as usize,
+                    [("submit", "undo"), ("cancel", "cancel")]
+                        .into_iter()
+                        .filter_map(|(action, label)| {
+                            app.keys
+                                .hint("input", action)
+                                .map(|key| (key, label.into()))
+                        }),
+                ),
+            ])
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(Block::bordered().title(" Confirm undo ")),
+            popup,
         );
     }
     app.theme.apply(frame.buffer_mut());
@@ -3638,6 +3679,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                 }
             } else if let Some(input) = &app.input
                 && input.confirm
+                && input.action != "undo"
                 && input.sources.contains(&revision.change_id)
             {
                 header.spans.push(Span::styled(
@@ -4121,6 +4163,37 @@ mod tests {
             working_copy: false,
             ..Revision::default()
         }
+    }
+
+    #[test]
+    fn undo_confirmation_is_modal_and_does_not_shift_the_graph() {
+        let mut app = key_fixture();
+        rendered_rows(&mut app, 40);
+        let positions = app.hit_rows.clone();
+        assert_eq!(press(&mut app, KeyCode::Char('u')), Effect::None);
+        let rows = rendered_rows(&mut app, 40);
+        let title_row = rows
+            .iter()
+            .position(|row| row.contains("Confirm undo"))
+            .unwrap();
+        assert!((15..25).contains(&title_row));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("enter undo") && row.contains("esc cancel"))
+        );
+        assert!(!rows.iter().any(|row| row.contains("[undo]")));
+        assert_eq!(app.hit_rows, positions);
+        assert!(!app.pending_command);
+        assert_eq!(press(&mut app, KeyCode::Esc), Effect::None);
+        assert!(app.input.is_none());
+        assert!(!app.pending_command);
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Effect::Request(crate::live::Request::Command(
+                crate::commands::CommandSpec::new(["undo"])
+            ))
+        );
     }
 
     #[test]

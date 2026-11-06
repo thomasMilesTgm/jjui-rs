@@ -32,5 +32,5 @@ cargo publish --locked
 ```
 
 Publication is a separate, explicit step. Confirm the published version installs with
-`cargo install jjui-rs --version 0.1.1 --locked` and reports the expected version with
+`cargo install jjui-rs --version 0.1.2 --locked` and reports the expected version with
 `jjui-rs --version`. Update the version in that command for later releases.
