@@ -647,3 +647,44 @@ fn auto_snapshot_config_and_cli_precedence_control_real_writes() {
         "contradictory CLI overrides must be rejected"
     );
 }
+
+#[test]
+fn tags_appear_and_disappear_in_native_live_snapshots() {
+    let temp = fixture();
+    let watch = Watch::new(temp.path());
+    watch.until(|v| v["type"] == "repository");
+    jj(temp.path(), &["tag", "set", "0.1.0"]);
+    let tagged = watch.until(|v| {
+        v["type"] == "repository"
+            && v["snapshot"]["revisions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| {
+                    r["tags"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|tag| tag == "0.1.0")
+                })
+    });
+    let before = heads(temp.path());
+    assert_eq!(
+        snapshot(temp.path())["operation"],
+        tagged["snapshot"]["operation"]
+    );
+    assert_eq!(
+        heads(temp.path()),
+        before,
+        "reading tags must not create operations"
+    );
+    jj(temp.path(), &["tag", "delete", "0.1.0"]);
+    watch.until(|v| {
+        v["type"] == "repository"
+            && v["snapshot"]["revisions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["tags"].as_array().unwrap().is_empty())
+    });
+}

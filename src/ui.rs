@@ -407,11 +407,12 @@ impl App {
         }
         let r = &self.snapshot.as_ref().unwrap().revisions[index];
         format!(
-            "{} {} {} {}",
+            "{} {} {} {} {}",
             r.change_id,
             r.commit_id,
             r.description,
-            r.bookmarks.join(" ")
+            r.bookmarks.join(" "),
+            r.tags.join(" ")
         )
         .to_lowercase()
         .contains(&self.filter.to_lowercase())
@@ -3285,6 +3286,16 @@ fn revision_header(
         ));
         spans.push(Span::raw(" "));
     }
+    if !revision.tags.is_empty() {
+        spans.push(Span::styled(
+            format!("{} ", revision.tags.join(" ")),
+            Style::default().fg(if wc {
+                Color::LightMagenta
+            } else {
+                Color::Magenta
+            }),
+        ));
+    }
     for workspace in &revision.workspaces {
         spans.push(Span::styled(
             format!("{workspace} "),
@@ -4110,6 +4121,32 @@ mod tests {
             working_copy: false,
             ..Revision::default()
         }
+    }
+
+    #[test]
+    fn tags_are_visible_and_searchable_even_in_immutable_history() {
+        let mut app = key_fixture();
+        let mut snapshot = app.full_snapshot.clone().unwrap();
+        snapshot.revisions[1].tags = vec!["0.1.0".into()];
+        snapshot.revisions[1].immutable = true;
+        app.update(snapshot);
+        assert!(!app.hidden_immutable.contains_key("parent"));
+        assert!(
+            rendered_rows(&mut app, 30)
+                .iter()
+                .any(|row| row.contains("0.1.0"))
+        );
+        let revision = &app.snapshot.as_ref().unwrap().revisions[1];
+        let header = revision_header(revision, "○ ", false, None);
+        assert!(
+            header
+                .spans
+                .iter()
+                .any(|span| span.content == "0.1.0 " && span.style.fg == Some(Color::Magenta))
+        );
+        app.filter = "0.1.0".into();
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.selected_id(), Some("parent"));
     }
 
     #[test]

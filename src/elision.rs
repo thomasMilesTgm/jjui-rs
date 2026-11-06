@@ -21,6 +21,7 @@ pub fn collapse(
         r.immutable
             && !r.root
             && !r.working_copy
+            && r.tags.is_empty()
             && !expanded.contains(&r.commit_id)
             && !marked.contains(&r.commit_id)
     };

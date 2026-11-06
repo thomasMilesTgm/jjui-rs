@@ -32,6 +32,7 @@ pub struct Revision {
     pub empty: bool,
     pub conflict: bool,
     pub bookmarks: Vec<String>,
+    pub tags: Vec<String>,
     pub working_copy: bool,
     pub workspaces: Vec<String>,
 }
@@ -208,7 +209,7 @@ impl Repository {
             // all() excludes rewritten commits, even when a remote still points
             // to one. Include those recorded remote states in the default graph.
             if self.revset.trim() == "all()" {
-                "all() | remote_bookmarks()"
+                "all() | remote_bookmarks() | tags()"
             } else {
                 &self.revset
             },
@@ -255,6 +256,12 @@ impl Repository {
                 empty: commit.is_empty(repo.as_ref()).await?,
                 conflict: commit.has_conflict(),
                 bookmarks,
+                tags: repo
+                    .view()
+                    .local_tags()
+                    .filter(|(_, target)| target.present_adds().any(|target| target == &id))
+                    .map(|(name, _)| name.as_str().to_owned())
+                    .collect(),
                 working_copy: wc == Some(&id),
                 workspaces: if repo.view().wc_commit_ids().len() > 1 {
                     repo.view()
