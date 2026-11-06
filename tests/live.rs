@@ -525,3 +525,63 @@ fn immutable_flags_follow_configured_heads_without_running_jj() {
     );
     assert_eq!(heads(temp.path()), before);
 }
+
+#[test]
+fn stale_workspace_stays_browsable_and_external_repair_is_detected() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    let other = temp.path().join("other");
+    std::fs::create_dir(&main).unwrap();
+    let run = |root: &Path, args: &[&str]| {
+        let output = Command::new("jj")
+            .args([
+                "--config",
+                "user.name=Test",
+                "--config",
+                "user.email=test@example.org",
+            ])
+            .args(args)
+            .current_dir(root)
+            .env("JJ_CONFIG", "")
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&main, &["git", "init", "--colocate"]);
+    std::fs::write(main.join("file"), "before\n").unwrap();
+    run(&main, &["describe", "-m", "base"]);
+    run(
+        &main,
+        &["workspace", "add", "-r", "@", other.to_str().unwrap()],
+    );
+    std::fs::write(main.join("file"), "after\n").unwrap();
+    run(&main, &["describe", "-m", "rewritten ancestor"]);
+    let before = heads(&main);
+    let watch = Watch::new(&other);
+    watch.until(|v| v["type"] == "repository" && v["snapshot"]["workspace_stale"] == true);
+    let auto = Watch::with_options(&other, &["--auto-snapshot"]);
+    auto.until(|v| v["type"] == "repository" && v["snapshot"]["workspace_stale"] == true);
+    assert_eq!(
+        std::fs::read_to_string(other.join("file")).unwrap(),
+        "before\n"
+    );
+    assert_eq!(
+        heads(&main),
+        before,
+        "browsing a stale workspace must not write operations"
+    );
+    drop(auto);
+    // Recovery may only change checkout metadata, not operation heads. The live
+    // reader must reload that metadata rather than caching the stale status.
+    run(&other, &["workspace", "update-stale"]);
+    watch.until(|v| v["type"] == "repository" && v["snapshot"]["workspace_stale"] == false);
+    assert_eq!(
+        std::fs::read_to_string(other.join("file")).unwrap(),
+        "after\n"
+    );
+}

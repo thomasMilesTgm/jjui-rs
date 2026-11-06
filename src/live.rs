@@ -83,10 +83,11 @@ pub fn start(
     // Initialize before entering raw mode, so startup errors are readable.
     let mut repo = Repository::open(&path, limit)?;
     let runtime = tokio::runtime::Runtime::new()?;
-    if auto_snapshot {
+    let mut first = runtime.block_on(repo.set_revset(initial_revset.clone()))?;
+    if auto_snapshot && !first.workspace_stale {
         runtime.block_on(repo.snapshot())?;
+        first = runtime.block_on(repo.refresh(true))?.unwrap();
     }
-    let first = runtime.block_on(repo.set_revset(initial_revset.clone()))?;
     send.send(Update::Repository(first))?;
     let root = repo.root();
     let metadata = repo.repo_path();
@@ -141,6 +142,7 @@ pub fn start(
             };
             let mut force = force;
             if auto_snapshot
+                && !repo.workspace_stale()
                 && (!changed.is_empty() || last_snapshot.elapsed() >= Duration::from_secs(2))
             {
                 last_snapshot = Instant::now();

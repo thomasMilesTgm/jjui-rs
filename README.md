@@ -32,7 +32,9 @@ working-tree edits through `jj-lib`. Editing and Git commands still use the `jj`
 - Expandable immutable-history rows in the live graph.
 - Inline files, diffs, operation history, and action prompts.
 - Bookmark and Git menus, with local/remote divergence markers.
-- Workspace switching, creation, renaming, forgetting, removal, and stale-workspace updates.
+- Workspace switching, creation, renaming, forgetting, removal, and stale-workspace recovery. Live
+  history reflects the shared repository; stale working-copy files are flagged for explicit
+  recovery.
 - Hunk restore and split, with checks for intervening edits.
 - Configurable themes and contextual keybinding hints.
 

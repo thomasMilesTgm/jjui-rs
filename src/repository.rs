@@ -38,6 +38,7 @@ pub struct Revision {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
+    pub workspace_stale: bool,
     pub operation: String,
     pub revisions: Vec<Revision>,
 }
@@ -46,6 +47,7 @@ pub struct Repository {
     workspace: Workspace,
     limit: usize,
     operation: Option<String>,
+    workspace_stale: bool,
     repo: Option<std::sync::Arc<ReadonlyRepo>>,
     revset: String,
 }
@@ -68,9 +70,14 @@ impl Repository {
             workspace,
             limit,
             operation: None,
+            workspace_stale: false,
             repo: None,
             revset: "all()".into(),
         })
+    }
+
+    pub fn workspace_stale(&self) -> bool {
+        self.workspace_stale
     }
 
     pub async fn snapshot(&mut self) -> Result<()> {
@@ -122,7 +129,20 @@ impl Repository {
                 repo.loader().workspace_store().get_workspace_path(name)?
             };
             let commit = repo.store().get_commit_async(id).await?;
+            let stale = if name.as_str() == self.workspace.workspace_name().as_str() {
+                Some(self.workspace_stale)
+            } else if let Some(path) = &path {
+                match Self::open(path, self.limit) {
+                    Ok(other) => crate::workspaces::is_stale(&other.workspace, repo)
+                        .await
+                        .ok(),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
             entries.push(crate::workspaces::Entry {
+                stale,
                 name: name.as_str().into(),
                 current: name.as_str() == self.workspace.workspace_name().as_str(),
                 available: path.as_ref().is_some_and(|p| p.join(".jj").is_dir()),
@@ -153,6 +173,7 @@ impl Repository {
     }
 
     pub async fn refresh(&mut self, force: bool) -> Result<Option<Snapshot>> {
+        self.reload_workspace()?;
         let loader = self.workspace.repo_loader();
         let heads = loader.op_heads_store().get_op_heads().await?;
         // load_at_head() can reconcile divergent operations and write a transaction.
@@ -164,11 +185,18 @@ impl Repository {
             );
         }
         let operation = heads[0].hex();
-        if !force && self.operation.as_ref() == Some(&operation) {
+        let unchanged = self.operation.as_ref() == Some(&operation);
+        let repo = if unchanged && !force {
+            self.repo.clone().context("Repository not loaded")?
+        } else {
+            let op = loader.load_operation(&heads[0]).await?;
+            loader.load_at(&op).await?
+        };
+        let workspace_stale = crate::workspaces::is_stale(&self.workspace, &repo).await?;
+        if !force && unchanged && self.workspace_stale == workspace_stale {
             return Ok(None);
         }
-        let op = loader.load_operation(&heads[0]).await?;
-        let repo = loader.load_at(&op).await?;
+        self.workspace_stale = workspace_stale;
         let wc = repo
             .view()
             .get_wc_commit_id(self.workspace.workspace_name());
@@ -243,6 +271,7 @@ impl Repository {
         self.repo = Some(repo.clone());
         self.operation = Some(operation.clone());
         Ok(Some(Snapshot {
+            workspace_stale,
             operation,
             revisions,
         }))

@@ -8,8 +8,40 @@ pub struct Entry {
     pub path: Option<PathBuf>,
     pub current: bool,
     pub available: bool,
+    pub stale: Option<bool>,
     pub commit: String,
     pub description: String,
+}
+
+/// Match jj's freshness rules without locking, snapshotting, or checking out files.
+/// The workspace must be freshly loaded so external repairs aren't hidden by a cache.
+pub async fn is_stale(
+    workspace: &jj_lib::workspace::Workspace,
+    repo: &jj_lib::repo::ReadonlyRepo,
+) -> anyhow::Result<bool> {
+    use jj_lib::repo::Repo;
+    let wc = workspace.working_copy();
+    if wc.operation_id() == repo.op_id() {
+        return Ok(false);
+    }
+    let Some(id) = repo.view().get_wc_commit_id(workspace.workspace_name()) else {
+        return Ok(true);
+    };
+    let commit = repo.store().get_commit_async(id).await?;
+    let operation = match repo.loader().load_operation(wc.operation_id()).await {
+        Ok(operation) => operation,
+        Err(_) => return Ok(true), // jj update-stale can recover a lost checkout operation.
+    };
+    let ancestors =
+        jj_lib::op_walk::closest_common_ancestors([operation], [repo.operation().clone()]).await?;
+    let Some(ancestor) = ancestors.first() else {
+        return Ok(true);
+    };
+    if ancestor.id() == repo.op_id() {
+        return Ok(false);
+    } // A concurrent checkout is newer than our read.
+    Ok(ancestor.id() != wc.operation_id()
+        || wc.tree()?.tree_ids_and_labels() != commit.tree().tree_ids_and_labels())
 }
 
 #[cfg(test)]

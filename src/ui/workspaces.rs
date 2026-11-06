@@ -177,6 +177,14 @@ pub(super) fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 entry.name,
                 if entry.current { " (current)" } else { "" }
             );
+            let name = format!(
+                "{name}{}",
+                if entry.stale == Some(true) {
+                    " [stale]"
+                } else {
+                    ""
+                }
+            );
             let path = entry
                 .path
                 .as_ref()
@@ -245,6 +253,7 @@ mod tests {
                     path: Some("/other".into()),
                     current,
                     available,
+                    stale: None,
                     commit: "0123456789abcdef".into(),
                     description: "example".into(),
                 }],

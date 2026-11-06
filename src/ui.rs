@@ -896,6 +896,7 @@ impl App {
                     | "undo"
                     | "redo"
                     | "snapshot"
+                    | "workspace_update"
                     | "fetch"
                     | "push"
                     | "remote_add"
@@ -1349,6 +1350,12 @@ impl App {
                 self.browse_index = 0;
                 self.busy = true;
                 return Effect::Request(crate::live::Request::Listing(query));
+            }
+            "workspace_update" => {
+                return self.command_effect(crate::commands::CommandSpec::new([
+                    "workspace",
+                    "update-stale",
+                ]));
             }
             "workspaces" => {
                 if self.pending_command || self.plugin_session.is_some() {
@@ -1942,6 +1949,7 @@ impl App {
         let (revisions, hidden) =
             crate::elision::collapse(&snapshot.revisions, &self.expanded_immutable, &self.marked);
         let snapshot = Snapshot {
+            workspace_stale: snapshot.workspace_stale,
             operation: snapshot.operation,
             revisions,
         };
@@ -2686,6 +2694,9 @@ fn footer_hints(app: &App, width: usize) -> Line<'static> {
         return render_footer_hints(app, width, hints);
     }
     let mut hints: Vec<(&str, &str, &str)> = Vec::new();
+    if app.snapshot.as_ref().is_some_and(|s| s.workspace_stale) && app.input.is_none() {
+        hints.push(("global", "workspace_update", "update stale workspace"));
+    }
     if app.view == View::Revisions
         && app.input.is_none()
         && app.target.is_none()
@@ -2930,6 +2941,21 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
         ])),
         header,
     );
+    if app.snapshot.as_ref().is_some_and(|s| s.workspace_stale) {
+        frame.render_widget(
+            Paragraph::new(format!(
+                " Working copy STALE · {} update workspace · graph shows repository state",
+                app.keys.label("global", "workspace_update")
+            ))
+            .style(Style::default().fg(Color::Yellow)),
+            ratatui::layout::Rect::new(
+                header.x,
+                header.y + 1,
+                header.width,
+                header.height.saturating_sub(1),
+            ),
+        );
+    }
     let mut status = app
         .error
         .as_deref()
@@ -4037,6 +4063,7 @@ mod tests {
     #[test]
     fn immutable_rows_expand_in_place_and_remain_expanded_after_refresh() {
         let snapshot = Snapshot {
+            workspace_stale: false,
             operation: "op".into(),
             revisions: vec![
                 Revision {
@@ -4182,22 +4209,26 @@ mod tests {
     fn selection_follows_rewrites_and_survives_removal() {
         let mut app = App::default();
         app.update(Snapshot {
+            workspace_stale: false,
             operation: "1".into(),
             revisions: vec![revision("a", "x"), revision("b", "y")],
         });
         app.selection.select(Some(1));
         app.update(Snapshot {
+            workspace_stale: false,
             operation: "2".into(),
             revisions: vec![revision("c", "y"), revision("a", "x")],
         });
         assert_eq!(app.selection.selected(), Some(0));
         app.update(Snapshot {
+            workspace_stale: false,
             operation: "3".into(),
             revisions: vec![revision("a", "x")],
         });
         assert_eq!(app.selection.selected(), Some(0));
         app.filter = "no match".into();
         app.update(Snapshot {
+            workspace_stale: false,
             operation: "4".into(),
             revisions: vec![revision("a", "x")],
         });
@@ -4213,6 +4244,7 @@ mod tests {
         child.parents.push("parent".into());
         child.working_copy = true;
         app.update(Snapshot {
+            workspace_stale: false,
             operation: "op".into(),
             revisions: vec![
                 child,
