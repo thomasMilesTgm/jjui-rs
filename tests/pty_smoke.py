@@ -45,6 +45,8 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
     def current():
         return next(r for r in snapshot()['revisions'] if r['working_copy'])
 
+    before_open = current()['commit_id']
+    (root / 'startup.txt').write_text('present before opening\n')
     theme = root / '.jj/test-theme.toml'
     theme.write_text('hint_key="#112233"\n')
     master, slave = pty.openpty()
@@ -94,6 +96,13 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
 
     try:
         shown('Revisions')
+        wait(lambda: current()['commit_id'] != before_open, 'TUI did not snapshot existing edits on opening')
+        opened_operation = snapshot()['operation']
+        (root / 'startup.txt').write_text('edited after opening\n')
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline:
+            read()
+        assert snapshot()['operation'] == opened_operation, 'auto-snapshot off still recorded subsequent edits'
         send(b'r')
         wait(lambda: screen().splitlines()[-1].startswith('Rebase '), 'rebase status is not in bottom footer')
         assert 'enter apply' in screen().splitlines()[-2]

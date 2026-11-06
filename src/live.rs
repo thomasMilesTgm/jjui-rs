@@ -74,6 +74,7 @@ pub fn start(
     limit: usize,
     auto_snapshot: bool,
     initial_revset: String,
+    snapshot_on_open: bool,
 ) -> Result<Live> {
     let (tasks, task_requests) = mpsc::sync_channel(8);
     let (send, updates) = mpsc::sync_channel(32);
@@ -83,7 +84,7 @@ pub fn start(
     let mut repo = Repository::open(&path, limit)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let mut first = runtime.block_on(repo.set_revset(initial_revset.clone()))?;
-    if auto_snapshot && !first.workspace_stale {
+    if (snapshot_on_open || auto_snapshot) && !first.workspace_stale {
         runtime.block_on(repo.snapshot())?;
         first = runtime.block_on(repo.refresh(true))?.unwrap();
     }

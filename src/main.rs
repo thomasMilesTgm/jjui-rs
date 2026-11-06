@@ -67,10 +67,10 @@ struct Args {
     /// Revision expression evaluated directly through jj-lib
     #[arg(short = 'r', long, default_value = "all()")]
     revisions: String,
-    /// Automatically snapshot working-tree edits through jj-lib (writes operations)
+    /// Keep snapshotting edits through jj-lib after the TUI opening snapshot
     #[arg(long, conflicts_with = "no_auto_snapshot")]
     auto_snapshot: bool,
-    /// Disable automatic snapshots, overriding config.toml
+    /// Disable ongoing automatic snapshots (the TUI still snapshots once when opened)
     #[arg(long)]
     no_auto_snapshot: bool,
     /// Maximum visible revisions
@@ -176,6 +176,7 @@ fn main() -> Result<()> {
         args.limit as usize,
         config.auto_snapshot,
         args.revisions,
+        !args.watch_json,
     )?;
     if args.watch_json {
         for update in &live.updates {

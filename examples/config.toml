@@ -1,3 +1,3 @@
-# Automatically record edits in the active workspace through jj-lib.
+# Keep recording edits in the active workspace after the initial TUI opening snapshot.
 # This rewrites working-copy commits and records operations; no jj subprocess is used.
 auto-snapshot = false

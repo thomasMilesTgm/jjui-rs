@@ -3,6 +3,24 @@ name = "jjui-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
+description = "A live terminal UI for Jujutsu with native repository access"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/thomasMilesTgm/jjui-rs"
+readme = "README.md"
+keywords = ["jujutsu", "jj", "tui", "version-control"]
+categories = ["command-line-utilities", "development-tools::version-control"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE-*",
+    "/src/**",
+    "/keybinds/*.toml",
+    "/themes/*.toml",
+    "/examples/**",
+    "/docs/**",
+    "/tests/**",
+]
 
 [dependencies]
 anyhow = "1"

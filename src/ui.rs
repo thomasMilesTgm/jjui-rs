@@ -2295,6 +2295,7 @@ pub fn run(
                             live.limit,
                             auto_snapshot,
                             app.revset.clone(),
+                            true,
                         )?;
                         Ok((next, keys, theme))
                     })();

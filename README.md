@@ -6,12 +6,14 @@ refresh.
 
 ## Install
 
-Requires Rust 1.97.1+ and `jj` 0.46. From this checkout:
+Requires Rust 1.97.1+ and `jj` 0.46. After the first crates.io release:
 
 ```sh
-cargo install --path . --locked
+cargo install jjui-rs --locked
 jjui-rs -R /path/to/workspace
 ```
+
+From a source checkout, use `cargo install --path . --locked`.
 
 ## Why another jj UI?
 
@@ -24,9 +26,9 @@ Direct repository access keeps history current without spawning a command for ea
 | Default bindings | jjui bindings            | Vim-oriented, with an optional jjui preset             |
 | Compatibility    | Established feature set  | Early implementation; Roto plugins, not Lua-compatible |
 
-By default, browsing does not snapshot files or create operations. Automatic snapshotting records
-working-tree edits through `jj-lib`; enable it in `config.toml` or with `--auto-snapshot`. Editing
-and Git commands still use the `jj` CLI.
+The TUI snapshots the active workspace once on opening or switching workspaces, through `jj-lib`.
+Enable ongoing snapshots in `config.toml` or with `--auto-snapshot`. Stale workspaces open for
+explicit recovery. Editing and Git commands still use the `jj` CLI.
 
 ## Features
 
@@ -55,25 +57,37 @@ Set this in `~/.config/jjui-rs/config.toml` to enable automatic snapshots:
 auto-snapshot = true
 ```
 
-- Defaults to `false`; applies to the workspace currently open in the TUI.
+- Defaults to `false`; controls ongoing snapshots in the active workspace, after the opening
+  snapshot.
+- `--once`, `--diff`, and `--watch-json` remain read-only unless automatic snapshotting is enabled.
 - Workspace-root `config.toml` overrides global settings; switching workspaces reloads settings.
 - `--auto-snapshot` / `--no-auto-snapshot` override the configured value.
 - `--config PATH` selects a file instead of the usual layers; `--check-config` validates it.
-- See the [example configuration](examples/config.toml).
+- See the
+  [example configuration](https://github.com/thomasMilesTgm/jjui-rs/blob/main/examples/config.toml).
 
 ### Keybindings
 
-- Customize `keybinds.toml`; see the [default bindings](keybinds/keybinds.default.toml).
+- Customize `keybinds.toml`; see the
+  [default bindings](https://github.com/thomasMilesTgm/jjui-rs/blob/main/keybinds/keybinds.default.toml).
 - For jjui muscle memory: `--keybinds /path/to/keybinds/keybinds.jjui.toml`, using the
-  [jjui preset](keybinds/keybinds.jjui.toml). Its comments document compatibility gaps.
+  [jjui preset](https://github.com/thomasMilesTgm/jjui-rs/blob/main/keybinds/keybinds.jjui.toml).
+  Its comments document compatibility gaps.
 
 ### Themes
 
 - Select `--theme dark`, `--theme light`, or `--theme /path/to/theme.toml`.
 - Without an explicit selection, global and workspace `theme.toml` files apply.
-- See the [example theme](themes/example.toml); validate with `--check-theme`.
+- See the [example theme](https://github.com/thomasMilesTgm/jjui-rs/blob/main/themes/example.toml);
+  validate with `--check-theme`.
 
 ### Plugins
 
-- Define custom actions in Roto; see the [plugin API and examples](docs/plugins.md).
+- Define custom actions in Roto; see the
+  [plugin API and examples](https://github.com/thomasMilesTgm/jjui-rs/blob/main/docs/plugins.md).
 - Load a manifest with `--plugins /path/to/plugins.toml`; validate with `--check-plugins`.
+
+## License
+
+Licensed under either [MIT](https://github.com/thomasMilesTgm/jjui-rs/blob/main/LICENSE-MIT) or
+[Apache-2.0](https://github.com/thomasMilesTgm/jjui-rs/blob/main/LICENSE-APACHE), at your option.
