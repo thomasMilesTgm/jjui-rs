@@ -2017,6 +2017,7 @@ pub fn run(
     theme_choice: Option<String>,
     plugin_config: crate::plugins::Config,
     keybinds_path: Option<std::path::PathBuf>,
+    config_source: crate::config::Source,
 ) -> Result<()> {
     let plugin_names = plugin_config.names();
     let plugins = crate::plugins::Worker::start(plugin_config)?;
@@ -2288,10 +2289,11 @@ pub fn run(
                             &plugin_names,
                         )?;
                         let theme = crate::theme::Theme::load(&path, theme_choice.as_deref())?;
+                        let auto_snapshot = config_source.load(&path)?.auto_snapshot;
                         let next = crate::live::start(
                             path,
                             live.limit,
-                            live.auto_snapshot,
+                            auto_snapshot,
                             app.revset.clone(),
                         )?;
                         Ok((next, keys, theme))
@@ -2397,7 +2399,10 @@ fn prompt_lines(app: &App, prefix: &str, width: usize) -> Vec<Line<'static>> {
     let Some(input) = &app.input else {
         return Vec::new();
     };
-    if matches!(input.action.as_str(), "set_bookmark" | "command") {
+    if matches!(
+        input.action.as_str(),
+        "set_bookmark" | "command" | "abandon"
+    ) {
         return Vec::new();
     }
     let mut text = vec![input.label.clone()];
@@ -2471,7 +2476,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     if let Some(input) = &app.input
         && !inline
         && app.workspace_menu.is_none()
-        && input.action != "command"
+        && !matches!(input.action.as_str(), "command" | "abandon")
     {
         let area = frame.area();
         let height = area.height.saturating_sub(2).min(9);
@@ -2912,6 +2917,45 @@ fn render_footer_hints(
     Line::from(spans)
 }
 
+fn footer_action_status(app: &App) -> Option<String> {
+    if let Some(input) = &app.input
+        && input.action == "abandon"
+    {
+        return Some(format!(
+            "{} · {}",
+            input.label,
+            input
+                .sources
+                .iter()
+                .map(|id| &id[..id.len().min(8)])
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some((action, sources, _)) = &app.target
+        && action == "rebase"
+    {
+        let destination = if app.selected_elision().is_some() {
+            "hidden commits (expand to choose)".into()
+        } else {
+            app.snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    app.selection
+                        .selected()
+                        .and_then(|i| snapshot.revisions.get(i))
+                })
+                .map(|revision| revision.change_id[..revision.change_id.len().min(8)].to_owned())
+                .unwrap_or_else(|| "no destination".into())
+        };
+        return Some(format!(
+            "Rebase {} revision(s) → {destination} · choose destination",
+            sources.len()
+        ));
+    }
+    None
+}
+
 fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(2),
@@ -2956,9 +3000,11 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
             ),
         );
     }
+    let action_status = footer_action_status(app);
     let mut status = app
         .error
         .as_deref()
+        .or(action_status.as_deref())
         .or(app.notice.as_deref())
         .map(str::to_owned)
         .unwrap_or_else(|| {
@@ -3012,6 +3058,8 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
                     Color::Yellow
                 } else if app.error.is_some() {
                     Color::Red
+                } else if action_status.is_some() {
+                    Color::Yellow
                 } else {
                     Color::DarkGray
                 }),
@@ -3607,7 +3655,10 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                     items.push(ListItem::new(line));
                 }
             }
-            if selected && let Some((action, sources, _)) = &app.target {
+            if selected
+                && let Some((action, sources, _)) = &app.target
+                && action != "rebase"
+            {
                 targets.push((i, None));
                 items.push(ListItem::new(format!(
                     "{}  {action}: {} → {} · {} apply · Esc cancel",
@@ -4592,7 +4643,7 @@ mod tests {
     }
 
     #[test]
-    fn action_prompts_and_rebase_destinations_are_inline() {
+    fn action_instructions_use_footers_without_shifting_graph_rows() {
         let mut app = key_fixture();
         let before = rendered_rows(&mut app, 40);
         let parent_before = before
@@ -4623,6 +4674,22 @@ mod tests {
             rows.iter()
                 .any(|line| line.contains("other") && line.contains("[rebase destination]"))
         );
+        assert!(
+            rows.last()
+                .unwrap()
+                .contains("Rebase 1 revision(s) → other")
+        );
+        assert!(rows[rows.len() - 2].contains("enter apply"));
+        assert_eq!(
+            rows.iter()
+                .position(|line| line.contains("other") && line.contains("parent")),
+            Some(parent_before)
+        );
+        assert!(
+            !rows[..rows.len() - 2]
+                .iter()
+                .any(|line| line.contains("choose destination") || line.contains("apply · Esc"))
+        );
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Char('a'));
         let rows = rendered_rows(&mut app, 40);
@@ -4634,7 +4701,12 @@ mod tests {
             .iter()
             .position(|line| line.contains("match-tw"))
             .unwrap();
-        assert!(prompt < next);
+        assert_eq!(prompt, rows.len() - 1);
+        assert_eq!(
+            Some(next),
+            before.iter().position(|line| line.contains("match-tw"))
+        );
+        assert!(rows[rows.len() - 2].contains("enter confirm"));
     }
 
     #[test]

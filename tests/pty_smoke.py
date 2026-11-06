@@ -94,6 +94,11 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
 
     try:
         shown('Revisions')
+        send(b'r')
+        wait(lambda: screen().splitlines()[-1].startswith('Rebase '), 'rebase status is not in bottom footer')
+        assert 'enter apply' in screen().splitlines()[-2]
+        send(b'\x1b')
+        wait(lambda: not screen().splitlines()[-1].startswith('Rebase '), 'rebase footer did not clear')
         wait(lambda: b'38;2;17;34;51' in output, 'theme key color missing')
         theme.write_text('hint_key="#224466"\n')
         send(b'gt')
@@ -309,6 +314,8 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
         shown('enter show hidden commits')
         send(b'@a')
         shown('Confirm abandon')
+        assert screen().splitlines()[-1].startswith('Confirm abandon'), 'abandon confirmation is not in bottom footer'
+        assert 'enter confirm' in screen().splitlines()[-2]
         send(b'\x1b')
         time.sleep(.1)
         send(b':q')

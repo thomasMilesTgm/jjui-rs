@@ -585,3 +585,65 @@ fn stale_workspace_stays_browsable_and_external_repair_is_detected() {
         "after\n"
     );
 }
+
+#[test]
+fn auto_snapshot_config_and_cli_precedence_control_real_writes() {
+    let temp = fixture();
+    let home = temp.path().join(".jj/app-config");
+    std::fs::create_dir_all(home.join("jjui-rs")).unwrap();
+    std::fs::write(home.join("jjui-rs/config.toml"), "auto-snapshot = true").unwrap();
+    let run = |args: &[&str]| {
+        let output = viewer(temp.path())
+            .env("XDG_CONFIG_HOME", &home)
+            .env("JJ_CONFIG", "")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    std::fs::write(temp.path().join("pending.txt"), "config snapshot\n").unwrap();
+    let before = heads(temp.path());
+    let output = run(&["--check-config"]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("auto-snapshot = true"));
+    assert_eq!(
+        heads(temp.path()),
+        before,
+        "checking configuration must be read-only"
+    );
+    run(&["--once", "--no-auto-snapshot"]);
+    assert_eq!(heads(temp.path()), before);
+    run(&["--once"]);
+    assert_ne!(
+        heads(temp.path()),
+        before,
+        "global setting did not enable snapshots"
+    );
+    let before = heads(temp.path());
+    std::fs::write(temp.path().join("config.toml"), "auto-snapshot = false").unwrap();
+    std::fs::write(temp.path().join("pending.txt"), "second edit\n").unwrap();
+    run(&["--once"]);
+    assert_eq!(
+        heads(temp.path()),
+        before,
+        "workspace setting did not disable snapshots"
+    );
+    run(&["--once", "--auto-snapshot"]);
+    assert_ne!(
+        heads(temp.path()),
+        before,
+        "CLI did not override workspace configuration"
+    );
+    let output = viewer(temp.path())
+        .args(["--auto-snapshot", "--no-auto-snapshot", "--once"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "contradictory CLI overrides must be rejected"
+    );
+}

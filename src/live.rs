@@ -50,7 +50,6 @@ pub enum Update {
 pub struct Live {
     pub repo_path: PathBuf,
     pub limit: usize,
-    pub auto_snapshot: bool,
     pub updates: Receiver<Update>,
     pub tasks: SyncSender<Request>,
     pub root: PathBuf,
@@ -308,7 +307,6 @@ pub fn start(
     Ok(Live {
         repo_path: metadata,
         limit,
-        auto_snapshot,
         updates,
         root: live_root,
         initial_revset,

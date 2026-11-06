@@ -24,8 +24,9 @@ Direct repository access keeps history current without spawning a command for ea
 | Default bindings | jjui bindings            | Vim-oriented, with an optional jjui preset             |
 | Compatibility    | Established feature set  | Early implementation; Roto plugins, not Lua-compatible |
 
-Browsing does not snapshot files or create operations. `--auto-snapshot` opts into recording
-working-tree edits through `jj-lib`. Editing and Git commands still use the `jj` CLI.
+By default, browsing does not snapshot files or create operations. Automatic snapshotting records
+working-tree edits through `jj-lib`; enable it in `config.toml` or with `--auto-snapshot`. Editing
+and Git commands still use the `jj` CLI.
 
 ## Features
 
@@ -43,8 +44,22 @@ require whole-file tools.
 
 ## Configuration
 
-Workspace keybinding and theme files override global files in `~/.config/jjui-rs/` (or
-`$XDG_CONFIG_HOME/jjui-rs/`). Explicit file options bypass these layers.
+Workspace configuration, keybinding, and theme files override global files in `~/.config/jjui-rs/`
+(or `$XDG_CONFIG_HOME/jjui-rs/`). Explicit file options bypass these layers.
+
+### Automatic snapshots
+
+Set this in `~/.config/jjui-rs/config.toml` to enable automatic snapshots:
+
+```toml
+auto-snapshot = true
+```
+
+- Defaults to `false`; applies to the workspace currently open in the TUI.
+- Workspace-root `config.toml` overrides global settings; switching workspaces reloads settings.
+- `--auto-snapshot` / `--no-auto-snapshot` override the configured value.
+- `--config PATH` selects a file instead of the usual layers; `--check-config` validates it.
+- See the [example configuration](examples/config.toml).
 
 ### Keybindings
 

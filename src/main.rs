@@ -2,6 +2,7 @@ mod bookmarks;
 mod browser;
 mod chunks;
 mod commands;
+mod config;
 mod elision;
 mod graph;
 mod input;
@@ -33,6 +34,12 @@ struct Args {
     /// Workspace directory (or a subdirectory)
     #[arg(short = 'R', long, default_value = ".")]
     repository: PathBuf,
+    /// Explicit config.toml (otherwise global and workspace files are layered)
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Validate and print effective application settings without opening the TUI
+    #[arg(long)]
+    check_config: bool,
     /// Explicit keybinds.toml (otherwise global and repository files are layered)
     #[arg(long)]
     keybinds: Option<PathBuf>,
@@ -61,8 +68,11 @@ struct Args {
     #[arg(short = 'r', long, default_value = "all()")]
     revisions: String,
     /// Automatically snapshot working-tree edits through jj-lib (writes operations)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_auto_snapshot")]
     auto_snapshot: bool,
+    /// Disable automatic snapshots, overriding config.toml
+    #[arg(long)]
+    no_auto_snapshot: bool,
     /// Maximum visible revisions
     #[arg(long, default_value = "200", value_parser = clap::value_parser!(u32).range(1..=10000))]
     limit: u32,
@@ -97,6 +107,21 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
+    let config_source = config::Source {
+        path: args.config,
+        auto_snapshot: if args.auto_snapshot {
+            Some(true)
+        } else if args.no_auto_snapshot {
+            Some(false)
+        } else {
+            None
+        },
+    };
+    let config = config_source.load(&args.repository)?;
+    if args.check_config {
+        println!("{}", toml::to_string_pretty(&config)?);
+        return Ok(());
+    }
     let theme = theme::Theme::load(&args.repository, args.theme.as_deref())?;
     if args.check_theme {
         println!("{}", toml::to_string_pretty(&theme)?);
@@ -121,7 +146,7 @@ fn main() -> Result<()> {
     if let Some(id) = &args.diff {
         let mut repo = repository::Repository::open(&args.repository, args.limit as usize)?;
         let runtime = tokio::runtime::Runtime::new()?;
-        if args.auto_snapshot {
+        if config.auto_snapshot {
             runtime.block_on(repo.snapshot())?;
         }
         runtime.block_on(repo.refresh(true))?;
@@ -134,7 +159,7 @@ fn main() -> Result<()> {
     if args.once {
         let mut repo = repository::Repository::open(&args.repository, args.limit as usize)?;
         let runtime = tokio::runtime::Runtime::new()?;
-        if args.auto_snapshot {
+        if config.auto_snapshot {
             runtime.block_on(repo.snapshot())?;
         }
         println!(
@@ -149,7 +174,7 @@ fn main() -> Result<()> {
     let live = live::start(
         args.repository,
         args.limit as usize,
-        args.auto_snapshot,
+        config.auto_snapshot,
         args.revisions,
     )?;
     if args.watch_json {
@@ -192,6 +217,14 @@ fn main() -> Result<()> {
         }
         Ok(())
     } else {
-        ui::run(live, keys, theme, args.theme, plugins, args.keybinds)
+        ui::run(
+            live,
+            keys,
+            theme,
+            args.theme,
+            plugins,
+            args.keybinds,
+            config_source,
+        )
     }
 }

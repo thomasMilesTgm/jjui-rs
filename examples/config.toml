@@ -1,0 +1,3 @@
+# Automatically record edits in the active workspace through jj-lib.
+# This rewrites working-copy commits and records operations; no jj subprocess is used.
+auto-snapshot = false
