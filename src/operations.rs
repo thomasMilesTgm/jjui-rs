@@ -17,6 +17,7 @@ pub struct Entry {
     pub current: bool,
     pub root: bool,
     pub snapshot: bool,
+    pub prefix_len: usize,
     pub user: String,
     pub workspace: Option<String>,
     pub end_millis: i64,
@@ -123,6 +124,7 @@ pub async fn load(repo: &ReadonlyRepo, commit: Option<&str>) -> Result<Vec<crate
                 current: op.id() == repo.operation().id(),
                 root: op.parent_ids().is_empty(),
                 snapshot: m.is_snapshot,
+                prefix_len: unique_prefix_len(repo, op.id()).await?,
                 user: format!("{}@{}", m.username, m.hostname),
                 workspace: m
                     .workspace_name
@@ -151,6 +153,24 @@ pub async fn load(repo: &ReadonlyRepo, commit: Option<&str>) -> Result<Vec<crate
     // every related operation is the parent of the preceding one.
     contract_parents(&mut rows, &ancestry);
     Ok(rows)
+}
+
+async fn unique_prefix_len(
+    repo: &ReadonlyRepo,
+    id: &jj_lib::op_store::OperationId,
+) -> Result<usize> {
+    use jj_lib::object_id::{HexPrefix, PrefixResolution};
+    let hex = id.hex();
+    for len in 1..=hex.len() {
+        let prefix = HexPrefix::try_from_hex(&hex[..len]).context("Invalid operation prefix")?;
+        if matches!(
+            repo.op_store().resolve_operation_id_prefix(&prefix).await?,
+            PrefixResolution::SingleMatch(_)
+        ) {
+            return Ok(len);
+        }
+    }
+    Ok(hex.len())
 }
 
 /// Compare the recorded working-copy trees across the actual operation edge.

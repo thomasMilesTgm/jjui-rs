@@ -10,6 +10,8 @@ use std::{
 
 #[derive(Debug, PartialEq)]
 pub enum Request {
+    Chunks { id: String, path: String },
+    ApplyChunks(crate::chunks::Request),
     Revset(String),
     Listing(crate::browser::Query),
     OperationDiff(String),
@@ -17,6 +19,11 @@ pub enum Request {
 }
 
 pub enum Update {
+    Chunks {
+        id: String,
+        path: String,
+        result: Result<crate::chunks::Session, String>,
+    },
     OperationDiff {
         id: String,
         result: Result<String, String>,
@@ -139,6 +146,22 @@ pub fn start(
             }
             if let Ok(request) = task_requests.try_recv() {
                 let update = match request {
+                    Request::Chunks { id, path } => Update::Chunks {
+                        result: runtime
+                            .block_on(repo.chunks(&id, &path))
+                            .map_err(|e| format!("{e:#}")),
+                        id,
+                        path,
+                    },
+                    Request::ApplyChunks(request) => {
+                        let result =
+                            crate::chunks::apply(&root, &request).map_err(|e| format!("{e:#}"));
+                        force = true;
+                        Update::CommandFinished {
+                            command: format!("{:?} selected hunks", request.action),
+                            result,
+                        }
+                    }
                     Request::Revset(expression) => {
                         match runtime.block_on(repo.set_revset(expression.clone())) {
                             Ok(snapshot) => {

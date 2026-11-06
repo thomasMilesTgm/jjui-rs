@@ -167,6 +167,14 @@ impl Keybinds {
             .map(|keys| keys.join("/"))
             .unwrap_or_else(|| "unbound".into())
     }
+    pub fn hint(&self, scope: &str, action: &str) -> Option<String> {
+        self.tables
+            .get(scope)
+            .and_then(|s| s.get(action))
+            .or_else(|| self.tables.get("global").and_then(|s| s.get(action)))
+            .and_then(|keys| keys.first())
+            .cloned()
+    }
 }
 fn parse_sequence(text: &str) -> Result<Vec<KeyEvent>> {
     let keys = text

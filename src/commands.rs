@@ -117,7 +117,7 @@ pub fn execute(root: &Path, spec: &CommandSpec) -> Result<String> {
     execute_process(spec.process(root)?, &spec.display())
 }
 
-fn execute_process(mut process: Command, display: &str) -> Result<String> {
+pub(crate) fn execute_process(mut process: Command, display: &str) -> Result<String> {
     let mut child = process
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

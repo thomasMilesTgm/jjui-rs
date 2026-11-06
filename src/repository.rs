@@ -82,6 +82,14 @@ impl Repository {
     pub async fn operation_diff(&self, id: &str) -> Result<String> {
         crate::operations::diff(self.repo.as_deref().context("Repository not loaded")?, id).await
     }
+    pub async fn chunks(&self, id: &str, path: &str) -> Result<crate::chunks::Session> {
+        crate::chunks::load(
+            self.repo.as_deref().context("Repository not loaded")?,
+            id,
+            path,
+        )
+        .await
+    }
 
     pub async fn set_revset(&mut self, expression: String) -> Result<Snapshot> {
         let previous = std::mem::replace(&mut self.revset, expression);

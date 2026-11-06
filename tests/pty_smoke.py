@@ -15,7 +15,8 @@ import time
 binary = str(Path(__file__).resolve().parents[1] / 'target/debug/jjui-rs')
 with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
     root = Path(directory)
-    env = {**os.environ, 'JJ_CONFIG': '', 'TERM': 'xterm-256color'}
+    env = {**os.environ, 'JJ_CONFIG': '', 'TERM': 'xterm-256color', 'COLORTERM': 'truecolor'}
+    env.pop('NO_COLOR', None)
 
     def jj(*args):
         subprocess.run(['jj', '--config', 'user.name=Test', '--config', 'user.email=test@example.org', *args], cwd=root, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -23,7 +24,7 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
     jj('git', 'init', '--colocate')
     env['XDG_CONFIG_HOME'] = str(root / '.jj/test-config')
     (root / '.jj/repo/config.toml').write_text('[user]\nname="Test"\nemail="test@example.org"\n')
-    (root / 'file.txt').write_text('base file\n')
+    (root / 'file.txt').write_text('base file\nmiddle\nbase end\n')
     jj('describe', '-m', 'base')
     keys = root / '.jj/keybinds.toml'
     keys.write_text('[revisions]\nnew=["x"]\n')
@@ -35,10 +36,12 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
     def current():
         return next(r for r in snapshot()['revisions'] if r['working_copy'])
 
+    theme = root / '.jj/test-theme.toml'
+    theme.write_text('hint_key="#112233"\n')
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 150, 0, 0))
     original = termios.tcgetattr(slave)
-    process = subprocess.Popen([binary, '-R', str(root), '--keybinds', str(keys)], stdin=slave, stdout=slave, stderr=slave, env=env)
+    process = subprocess.Popen([binary, '-R', str(root), '--keybinds', str(keys), '--theme', str(theme)], stdin=slave, stdout=slave, stderr=slave, env=env)
     output = bytearray()
 
     def read(timeout=.1):
@@ -82,6 +85,11 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
 
     try:
         shown('Revisions')
+        wait(lambda: b'38;2;17;34;51' in output, 'theme key color missing')
+        theme.write_text('hint_key="#224466"\n')
+        send(b'gt')
+        shown('Theme reloaded')
+        wait(lambda: b'38;2;34;68;102' in output, 'reloaded theme key color missing')
         original_op = snapshot()['operation']
         send(b'gn')
         for _ in range(3):
@@ -125,6 +133,29 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
         shown('+snapshot addition')
         send(b'h')
         shown('Operations for change')
+        send(b'h')
+        (root / 'file.txt').write_text('chunk first\nmiddle\nchunk last\n')
+        jj('util', 'snapshot')
+        shown(snapshot()['operation'][:12])
+        send(b'l')
+        shown('M  file.txt')
+        send(b'i')
+        shown('Hunks · file.txt')
+        shown('+chunk first')
+        send(b'vr')
+        shown('Restore 1 selected hunk(s)?')
+        send(b'\r')
+        wait(lambda: (root / 'file.txt').read_text() == 'base file\nmiddle\nchunk last\n', 'partial hunk restore failed')
+        shown('Restore selected hunks completed')
+        shown('M  file.txt')
+        send(b'i')
+        shown('+chunk last')
+        send(b's')
+        shown('Split 1 selected hunk(s): description')
+        send(b'split chunk\r')
+        shown('Split selected hunks completed')
+        assert any(r['description'].strip() == 'split chunk' for r in snapshot()['revisions'])
+        assert (root / 'file.txt').read_text() == 'base file\nmiddle\nchunk last\n'
         send(b'hb')
         shown('Local / remote bookmarks')
         shown('topic')
@@ -147,7 +178,7 @@ with tempfile.TemporaryDirectory(prefix='jjui-ui-') as directory:
             read()
         assert process.wait(timeout=1) == 0
         assert termios.tcgetattr(slave) == original
-        print('PTY smoke passed: remapping, new/describe, bookmarks, operations, file finder, revsets, cancellation, terminal restoration')
+        print('PTY smoke passed: theme reload, remapping, new/describe, bookmarks, operations, hunk restore/split, file finder, revsets, cancellation, terminal restoration')
     finally:
         if process.poll() is None:
             process.kill()

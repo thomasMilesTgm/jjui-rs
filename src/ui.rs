@@ -18,6 +18,9 @@ use std::{
 #[derive(Default)]
 struct App {
     keys: crate::keybinds::Keybinds,
+    theme: crate::theme::Theme,
+    chunks: Option<ChunkEditor>,
+    pending_chunk: Option<crate::chunks::Request>,
     key_sequence: Vec<KeyEvent>,
     key_sequence_scope: String,
     search_backwards: bool,
@@ -32,6 +35,7 @@ struct App {
     operation_diff: Option<OperationDiff>,
     operation_selection: ListState,
     operation_hit_rows: Vec<(ratatui::layout::Rect, usize)>,
+    chunk_hit_rows: Vec<(ratatui::layout::Rect, usize, usize)>,
     browse_index: usize,
     file_filter: String,
     marked_files: HashSet<String>,
@@ -65,6 +69,7 @@ enum View {
     #[default]
     Revisions,
     Files,
+    Chunks,
     Diff,
     Bookmarks,
     Help,
@@ -76,6 +81,16 @@ enum View {
     Finder,
 }
 
+struct ChunkEditor {
+    line_offset: usize,
+    id: String,
+    path: String,
+    session: Option<crate::chunks::Session>,
+    error: Option<String>,
+    index: usize,
+    selected: std::collections::BTreeSet<usize>,
+}
+
 struct OperationDiff {
     id: String,
     origin: View,
@@ -84,6 +99,7 @@ struct OperationDiff {
 
 #[derive(Debug, PartialEq)]
 enum Effect {
+    ReloadTheme,
     None,
     Quit,
     Refresh,
@@ -250,11 +266,21 @@ impl App {
             let action = self.keys.resolve("input", key);
             if action.as_deref() == Some("cancel") {
                 self.input = None;
+                self.pending_chunk = None;
                 return Effect::None;
             }
             if matches!(action.as_deref(), Some("submit" | "accept")) {
                 let input = self.input.take().unwrap();
                 match input.action.as_str() {
+                    "chunk_restore" | "chunk_split" => {
+                        if let Some(mut request) = self.pending_chunk.take() {
+                            request.description = input.text;
+                            self.pending_command = true;
+                            self.busy = true;
+                            return Effect::Request(crate::live::Request::ApplyChunks(request));
+                        }
+                        return Effect::None;
+                    }
                     "revset" => {
                         self.busy = true;
                         return Effect::Request(crate::live::Request::Revset(input.text));
@@ -342,6 +368,7 @@ impl App {
         let scope = match self.view {
             View::Revisions => "revisions",
             View::Files => "files",
+            View::Chunks => "chunks",
             View::Bookmarks => "bookmarks",
             View::Operations | View::InlineOperations => "operations",
             View::Git => "git",
@@ -473,6 +500,137 @@ impl App {
         {
             self.notice = Some("An action is still running".into());
             return Effect::None;
+        }
+        if action == "theme_reload" {
+            return Effect::ReloadTheme;
+        }
+        if action == "chunks" && matches!(self.view, View::Files | View::Diff) {
+            if let Some(preview) = &self.preview
+                && Some(preview.commit_id.as_str()) == self.selected_id()
+                && let Some(file) = preview.files.get(self.file_index)
+            {
+                let id = preview.commit_id.clone();
+                let path = file.path.clone();
+                self.chunks = Some(ChunkEditor {
+                    line_offset: 0,
+                    id: id.clone(),
+                    path: path.clone(),
+                    session: None,
+                    error: None,
+                    index: 0,
+                    selected: Default::default(),
+                });
+                self.view = View::Chunks;
+                self.preview_focus = false;
+                self.busy = true;
+                return Effect::Request(crate::live::Request::Chunks { id, path });
+            }
+            self.notice = Some("Open a file diff before selecting hunks".into());
+            return Effect::None;
+        }
+        if self.view == View::Chunks {
+            if action == "cancel" {
+                self.view = View::Files;
+                self.chunks = None;
+                return Effect::None;
+            }
+            if let Some(editor) = &mut self.chunks
+                && let Some(session) = &editor.session
+            {
+                let hunks = session.hunks();
+                let count = hunks.len();
+                if action == "scroll_down" {
+                    editor.line_offset = (editor.line_offset + 1)
+                        .min(hunks[editor.index].patch.lines().count().saturating_sub(1));
+                    return Effect::None;
+                }
+                if action == "scroll_up" {
+                    editor.line_offset = editor.line_offset.saturating_sub(1);
+                    return Effect::None;
+                }
+                if matches!(
+                    action.as_str(),
+                    "up" | "down" | "page_up" | "page_down" | "first" | "last"
+                ) {
+                    editor.line_offset = 0;
+                }
+                match action.as_str() {
+                    "up" => editor.index = editor.index.saturating_sub(1),
+                    "down" => editor.index = (editor.index + 1).min(count.saturating_sub(1)),
+                    "page_up" => editor.index = editor.index.saturating_sub(page_size),
+                    "page_down" => {
+                        editor.index = (editor.index + page_size).min(count.saturating_sub(1))
+                    }
+                    "first" => editor.index = 0,
+                    "last" => editor.index = count.saturating_sub(1),
+                    "select" => {
+                        if !editor.selected.remove(&editor.index) {
+                            editor.selected.insert(editor.index);
+                        }
+                    }
+                    "select_all" => {
+                        if editor.selected.len() == count {
+                            editor.selected.clear();
+                        } else {
+                            editor.selected = (0..count).collect();
+                        }
+                    }
+                    "restore" | "split" => {
+                        let selected = if editor.selected.is_empty() {
+                            [editor.index].into()
+                        } else {
+                            editor.selected.clone()
+                        };
+                        let amount = selected.len();
+                        self.pending_chunk = Some(crate::chunks::Request {
+                            session: session.clone(),
+                            selected,
+                            action: if action == "restore" {
+                                crate::chunks::Action::Restore
+                            } else {
+                                crate::chunks::Action::Split
+                            },
+                            description: String::new(),
+                        });
+                        let restore = action == "restore";
+                        self.start_input(
+                            if restore {
+                                "chunk_restore"
+                            } else {
+                                "chunk_split"
+                            },
+                            &format!(
+                                "{} {amount} selected hunk(s){}",
+                                if restore { "Restore" } else { "Split" },
+                                if restore { "?" } else { ": description" }
+                            ),
+                            String::new(),
+                            restore,
+                        );
+                        return Effect::None;
+                    }
+                    _ => {}
+                }
+                if matches!(
+                    action.as_str(),
+                    "up" | "down"
+                        | "page_up"
+                        | "page_down"
+                        | "first"
+                        | "last"
+                        | "select"
+                        | "select_all"
+                ) {
+                    return Effect::None;
+                }
+            }
+            if matches!(
+                action.as_str(),
+                "restore" | "split" | "select" | "select_all" | "scroll_down" | "scroll_up"
+            ) {
+                self.notice = Some("No editable hunks loaded".into());
+                return Effect::None;
+            }
         }
         if action == "help" {
             self.view = View::Help;
@@ -889,6 +1047,21 @@ impl App {
         }
         match mouse.kind {
             event::MouseEventKind::Down(event::MouseButton::Left) => {
+                if let Some((_, index, offset)) = self
+                    .chunk_hit_rows
+                    .iter()
+                    .find(|(rect, _, _)| rect.contains((mouse.column, mouse.row).into()))
+                    && let Some(editor) = &mut self.chunks
+                {
+                    editor.index = *index;
+                    editor.line_offset = *offset;
+                    if mouse.modifiers.contains(KeyModifiers::CONTROL)
+                        && !editor.selected.remove(index)
+                    {
+                        editor.selected.insert(*index);
+                    }
+                    return;
+                }
                 if let Some((_, index)) = self
                     .operation_hit_rows
                     .iter()
@@ -920,7 +1093,17 @@ impl App {
             }
             event::MouseEventKind::ScrollDown | event::MouseEventKind::ScrollUp => {
                 let down = mouse.kind == event::MouseEventKind::ScrollDown;
-                if matches!(self.view, View::Operations | View::InlineOperations) {
+                if self.view == View::Chunks
+                    && let Some(editor) = &mut self.chunks
+                    && let Some(session) = &editor.session
+                {
+                    editor.index = if down {
+                        (editor.index + 1).min(session.hunks().len().saturating_sub(1))
+                    } else {
+                        editor.index.saturating_sub(1)
+                    };
+                    editor.line_offset = 0;
+                } else if matches!(self.view, View::Operations | View::InlineOperations) {
                     self.browse_index = if down {
                         (self.browse_index + 1).min(self.listing.len().saturating_sub(1))
                     } else {
@@ -1241,7 +1424,12 @@ impl App {
     }
 }
 
-pub fn run(live: Live, keys: crate::keybinds::Keybinds) -> Result<()> {
+pub fn run(
+    live: Live,
+    keys: crate::keybinds::Keybinds,
+    theme: crate::theme::Theme,
+    theme_choice: Option<String>,
+) -> Result<()> {
     let mut terminal = ratatui::init();
     crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
     let _mouse = MouseCapture;
@@ -1250,12 +1438,26 @@ pub fn run(live: Live, keys: crate::keybinds::Keybinds) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut app = App {
             keys,
+            theme,
             revset: live.initial_revset.clone(),
             ..App::default()
         };
         loop {
             for update in live.updates.try_iter() {
                 match update {
+                    Update::Chunks { id, path, result } => {
+                        app.busy = false;
+                        if app.view == View::Chunks
+                            && let Some(editor) = &mut app.chunks
+                            && editor.id == id
+                            && editor.path == path
+                        {
+                            match result {
+                                Ok(session) => editor.session = Some(session),
+                                Err(error) => editor.error = Some(error),
+                            }
+                        }
+                    }
                     Update::OperationDiff { id, result } => {
                         app.busy = false;
                         app.apply_operation_diff(&id, result);
@@ -1320,6 +1522,10 @@ pub fn run(live: Live, keys: crate::keybinds::Keybinds) -> Result<()> {
                         app.pending_command = false;
                         match result {
                             Ok(output) => {
+                                if command.ends_with("selected hunks") {
+                                    app.view = View::Files;
+                                    app.chunks = None;
+                                }
                                 app.output = output;
                                 app.follow_working_copy = ["jj new", "jj edit", "jj commit"]
                                     .iter()
@@ -1381,6 +1587,16 @@ pub fn run(live: Live, keys: crate::keybinds::Keybinds) -> Result<()> {
             };
             let page_size = terminal.size()?.height.saturating_sub(6) as usize / 2;
             match app.handle_key(key, page_size) {
+                Effect::ReloadTheme => {
+                    match crate::theme::Theme::load(&live.root, theme_choice.as_deref()) {
+                        Ok(theme) => {
+                            app.theme = theme;
+                            app.notice = Some("Theme reloaded".into());
+                            app.error = None;
+                        }
+                        Err(error) => app.error = Some(format!("{error:#}")),
+                    }
+                }
                 Effect::Quit => break,
                 Effect::Refresh => {
                     let _ = live.refresh.try_send(());
@@ -1445,15 +1661,80 @@ impl Drop for MouseCapture {
     }
 }
 
+fn prompt_lines(app: &App, prefix: &str, width: usize) -> Vec<Line<'static>> {
+    let Some(input) = &app.input else {
+        return Vec::new();
+    };
+    let mut text = vec![input.label.clone()];
+    if input.confirm {
+        if !input.text.is_empty() {
+            text.push(input.text.clone());
+        }
+        if !input.files.is_empty() {
+            text.push(format!("Files: {}", input.files.join(", ")));
+        }
+    } else {
+        text.push(input.visible());
+    }
+    text.push(format!(
+        "{} apply · {} cancel",
+        app.keys.label("input", "submit"),
+        app.keys.label("input", "cancel")
+    ));
+    let available = width.saturating_sub(Line::raw(prefix).width() + 2).max(1);
+    let mut result = Vec::new();
+    for text in text {
+        let mut line = String::new();
+        let mut used = 0;
+        for c in text.chars().chain(std::iter::once('\n')) {
+            let size = Span::raw(c.to_string()).width();
+            if c == '\n' || used + size > available {
+                result.push(Line::from(vec![
+                    Span::styled(format!("{prefix}  "), Style::default().fg(Color::Green)),
+                    Span::styled(
+                        std::mem::take(&mut line),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
+                used = 0;
+            }
+            if c != '\n' {
+                line.push(c);
+                used += size;
+            }
+        }
+    }
+    result
+}
+
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     app.hit_rows.clear();
     app.operation_hit_rows.clear();
+    app.chunk_hit_rows.clear();
     draw_body(frame, app);
-    if let Some(input) = &app.input {
+    let inline = match app.view {
+        View::Revisions | View::Files | View::InlineOperations => app.selected_id().is_some(),
+        View::Chunks => {
+            app.selected_id().is_some()
+                && app
+                    .chunks
+                    .as_ref()
+                    .is_some_and(|editor| editor.session.is_some())
+        }
+        View::Operations | View::Bookmarks | View::Finder => !app.listing_rows().is_empty(),
+        _ => false,
+    };
+    if let Some(input) = &app.input
+        && !inline
+    {
         let area = frame.area();
-        let height = area.height.min(9);
-        let area =
-            ratatui::layout::Rect::new(area.x, area.y + area.height - height, area.width, height);
+        let height = area.height.saturating_sub(2).min(9);
+        let area = ratatui::layout::Rect::new(
+            area.x,
+            area.y + area.height.saturating_sub(height + 2),
+            area.width,
+            height,
+        );
         frame.render_widget(ratatui::widgets::Clear, area);
         let text = if input.confirm {
             format!(
@@ -1478,6 +1759,228 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             area,
         );
     }
+    app.theme.apply(frame.buffer_mut());
+}
+
+fn footer_mode(app: &App) -> &'static str {
+    if app.input.is_some() {
+        return "Input";
+    }
+    if app.target.is_some() {
+        return "Choose destination";
+    }
+    if app.preview_focus && app.preview_visible {
+        return "Preview";
+    }
+    match app.view {
+        View::Revisions => "Revisions",
+        View::Files => "Files",
+        View::Chunks => "Hunks",
+        View::Operations => "Operations",
+        View::InlineOperations => "Related operations",
+        View::Diff => "Diff",
+        View::OperationDiff => "Snapshot diff",
+        View::Bookmarks => "Bookmarks",
+        View::Finder => "File finder",
+        View::Git => "Git",
+        View::Help => "Help",
+        View::Text => "Output",
+    }
+}
+
+fn footer_hints(app: &App, width: usize) -> Line<'static> {
+    let scope = match app.view {
+        View::Revisions => "revisions",
+        View::Files => "files",
+        View::Chunks => "chunks",
+        View::Operations | View::InlineOperations => "operations",
+        View::Bookmarks => "bookmarks",
+        View::Finder => "finder",
+        View::Git => "git",
+        _ => "view",
+    };
+    let mut hints: Vec<(&str, &str, &str)> = Vec::new();
+    if let Some(input) = &app.input {
+        hints.extend([
+            (
+                "input",
+                "submit",
+                if input.confirm { "confirm" } else { "apply" },
+            ),
+            ("input", "cancel", "cancel"),
+        ]);
+        if !input.confirm {
+            hints.extend([
+                ("input", "delete_word", "delete word"),
+                ("input", "delete_to_start", "clear to start"),
+                ("input", "newline", "newline"),
+            ]);
+        }
+    } else if app.target.is_some() {
+        hints.extend([
+            ("revisions", "down", "next destination"),
+            ("revisions", "up", "previous"),
+            ("input", "submit", "apply"),
+            ("global", "cancel", "cancel"),
+        ]);
+    } else if app.preview_focus && app.preview_visible {
+        hints.extend([
+            (scope, "down", "scroll down"),
+            (scope, "up", "scroll up"),
+            (scope, "half_page_down", "half down"),
+            (scope, "half_page_up", "half up"),
+            (scope, "focus", "back to graph"),
+        ]);
+    } else {
+        match app.view {
+            View::Revisions => hints.extend([
+                (scope, "down", "down"),
+                (scope, "up", "up"),
+                (scope, "details", "files"),
+                (scope, "diff", "diff"),
+                (scope, "describe", "describe"),
+                (scope, "operations", "operations"),
+                (scope, "new", "new"),
+                (scope, "select", "mark"),
+                ("global", "help", "help"),
+            ]),
+            View::Files => hints.extend([
+                (scope, "down", "down"),
+                (scope, "up", "up"),
+                (scope, "diff", "diff"),
+                (scope, "chunks", "hunks"),
+                (scope, "select", "mark"),
+                (scope, "restore", "restore"),
+                (scope, "split", "split"),
+                (scope, "cancel", "back"),
+            ]),
+            View::Chunks
+                if app
+                    .chunks
+                    .as_ref()
+                    .and_then(|editor| editor.session.as_ref())
+                    .is_none() =>
+            {
+                hints.push((scope, "cancel", "back"));
+            }
+            View::Chunks => hints.extend([
+                (scope, "down", "next hunk"),
+                (scope, "up", "previous"),
+                (scope, "select", "mark"),
+                (scope, "select_all", "all"),
+                (scope, "restore", "restore"),
+                (scope, "split", "split"),
+                (scope, "scroll_down", "scroll"),
+                (scope, "cancel", "back"),
+            ]),
+            View::Operations | View::InlineOperations => {
+                hints.extend([(scope, "down", "down"), (scope, "up", "up")]);
+                if app
+                    .listing
+                    .get(app.browse_index)
+                    .and_then(|row| row.operation.as_ref())
+                    .is_some_and(|op| op.snapshot)
+                {
+                    hints.push((scope, "diff", "snapshot diff"));
+                }
+                if !app.listing.is_empty() {
+                    hints.push((scope, "operation_restore", "restore operation"));
+                }
+                hints.push((
+                    scope,
+                    if app.view == View::InlineOperations {
+                        "full_operations"
+                    } else {
+                        "operations"
+                    },
+                    if app.view == View::InlineOperations {
+                        "all operations"
+                    } else {
+                        "related operations"
+                    },
+                ));
+                hints.push((scope, "cancel", "back"));
+            }
+            View::Bookmarks => {
+                hints.extend([
+                    (scope, "down", "down"),
+                    (scope, "up", "up"),
+                    (scope, "set_bookmark", "set"),
+                ]);
+                if app
+                    .listing
+                    .get(app.browse_index)
+                    .is_some_and(|row| row.id.contains('@'))
+                {
+                    hints.extend([
+                        (scope, "bookmark_track", "track"),
+                        (scope, "bookmark_untrack", "untrack"),
+                    ]);
+                } else if !app.listing.is_empty() {
+                    hints.push((scope, "bookmark_delete", "delete"));
+                }
+                hints.push((scope, "cancel", "back"));
+            }
+            View::Finder => hints.extend([
+                (scope, "down", "down"),
+                (scope, "up", "up"),
+                (scope, "search", "filter"),
+                (scope, "open_file", "open"),
+                (scope, "cancel", "back"),
+            ]),
+            View::Git => hints.extend([
+                (scope, "fetch", "fetch"),
+                (scope, "push", "push"),
+                (scope, "remote_add", "add remote"),
+                (scope, "remote_remove", "remove remote"),
+                (scope, "cancel", "back"),
+            ]),
+            View::Diff | View::OperationDiff | View::Help | View::Text => {
+                hints.extend([
+                    (scope, "down", "scroll down"),
+                    (scope, "up", "scroll up"),
+                    (scope, "half_page_down", "half down"),
+                    (scope, "half_page_up", "half up"),
+                ]);
+                if app.view == View::Diff {
+                    hints.push((scope, "chunks", "hunks"));
+                }
+                hints.push((scope, "cancel", "back"));
+            }
+        }
+    }
+    let (key_color, action_color, separator_color) = app.theme.hint_colors();
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for (scope, action, label) in hints {
+        let Some(key) = app.keys.hint(scope, action) else {
+            continue;
+        };
+        let key = if key.split_whitespace().all(|part| part.chars().count() == 1) {
+            key.replace(' ', "")
+        } else {
+            key
+        };
+        let separator = if spans.is_empty() { "" } else { "  ·  " };
+        let needed = Line::raw(format!("{separator}{key} {label}")).width();
+        if used + needed > width {
+            continue;
+        }
+        spans.push(Span::styled(
+            separator,
+            Style::default().fg(separator_color),
+        ));
+        spans.push(Span::styled(
+            key,
+            Style::default().fg(key_color).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            Style::default().fg(action_color),
+        ));
+        used += needed;
+    }
+    Line::from(spans)
 }
 
 fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
@@ -1509,34 +2012,31 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
         ])),
         header,
     );
-    let footer_text = app
+    let status = app
         .error
         .as_deref()
         .or(app.notice.as_deref())
         .map(str::to_owned)
         .unwrap_or_else(|| {
             format!(
-                "{} move · {} files · {} diff · {} preview · {} help · {} quit\n{} · revset: {}",
-                app.keys.label("revisions", "down"),
-                app.keys.label("revisions", "details"),
-                app.keys.label("revisions", "diff"),
-                app.keys.label("revisions", "preview"),
-                app.keys.label("global", "help"),
-                app.keys.label("global", "quit"),
-                if app.busy {
-                    "Action running…"
-                } else {
-                    "LIVE"
-                },
+                "{} · {} · revset: {}",
+                footer_mode(app),
+                if app.busy { "Working…" } else { "LIVE" },
                 app.revset
             )
         });
     frame.render_widget(
-        Paragraph::new(footer_text).style(Style::default().fg(if app.error.is_some() {
-            Color::Red
-        } else {
-            Color::Gray
-        })),
+        Paragraph::new(vec![
+            footer_hints(app, footer.width as usize),
+            Line::styled(
+                status,
+                Style::default().fg(if app.error.is_some() {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+        ]),
         footer,
     );
     if app.view == View::Operations {
@@ -1547,7 +2047,18 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
         let rows = app.listing_rows();
         let items: Vec<_> = rows
             .iter()
-            .map(|row| ListItem::new(row.label.clone()))
+            .enumerate()
+            .map(|(index, row)| {
+                let mut lines = vec![Line::raw(row.label.clone())];
+                if index == app.browse_index {
+                    lines.extend(prompt_lines(
+                        app,
+                        "  ",
+                        body.width.saturating_sub(4) as usize,
+                    ));
+                }
+                ListItem::new(lines)
+            })
             .collect();
         let mut state = ListState::default();
         if !items.is_empty() {
@@ -1652,7 +2163,10 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
 // Keep ID disambiguation independent of the visible graph window. jj-lib supplies
 // repository-wide prefix lengths; eight characters is jj's default display width.
 fn log_id(id: &str, prefix_len: usize, color: Color) -> Vec<Span<'static>> {
-    let end = id.len().min(prefix_len.max(8));
+    log_id_width(id, prefix_len, color, 8)
+}
+fn log_id_width(id: &str, prefix_len: usize, color: Color, width: usize) -> Vec<Span<'static>> {
+    let end = id.len().min(prefix_len.max(width));
     let prefix = prefix_len.min(end);
     vec![
         Span::styled(
@@ -1814,8 +2328,8 @@ fn operation_lines(
             },
         ),
         Span::raw(" "),
-        Span::styled(short(&row.id).to_owned(), Style::default().fg(blue)),
     ];
+    spans.extend(log_id_width(&row.id, op.prefix_len, blue, 12));
     if op.root {
         spans.push(Span::styled(" root()", Style::default().fg(Color::Green)));
         return vec![Line::from(spans).style(style)];
@@ -1909,6 +2423,17 @@ fn draw_operations(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
             indices.push(index);
             items.push(ListItem::new(line));
         }
+        if index == app.browse_index && app.input.is_some() {
+            for line in prompt_lines(
+                app,
+                &graph.continuation,
+                area.width.saturating_sub(4) as usize,
+            ) {
+                selected = Some(items.len());
+                indices.push(index);
+                items.push(ListItem::new(line));
+            }
+        }
     }
     if items.is_empty() {
         items.push(ListItem::new(if app.busy {
@@ -1949,6 +2474,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
     let mut selected_row = None;
     let mut targets = Vec::new();
     let mut operation_rows = std::collections::HashMap::new();
+    let mut chunk_rows = std::collections::HashMap::new();
     if let Some(snapshot) = &app.snapshot {
         for (i, revision) in snapshot.revisions.iter().enumerate() {
             let graph = &app.graph[i];
@@ -1962,17 +2488,67 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                 selected_row = Some(items.len());
             }
             targets.push((i, None));
-            items.push(
-                ListItem::new(revision_header(
-                    revision,
-                    &graph.node,
-                    app.marked.contains(&revision.commit_id),
-                ))
-                .style(style),
+            let mut header = revision_header(
+                revision,
+                &graph.node,
+                app.marked.contains(&revision.commit_id),
             );
+            if let Some((action, sources, _)) = &app.target {
+                if sources.contains(&revision.change_id) {
+                    header.spans.push(Span::styled(
+                        format!(" [{action} source]"),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                if selected {
+                    header.spans.push(Span::styled(
+                        format!(" [{action} destination]"),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
+            } else if let Some(input) = &app.input
+                && input.confirm
+                && input.sources.contains(&revision.change_id)
+            {
+                header.spans.push(Span::styled(
+                    format!(" [{}]", input.action),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            items.push(ListItem::new(header).style(style));
             if !revision.root {
                 targets.push((i, None));
                 items.push(ListItem::new(revision_description(revision, &graph.edge)).style(style));
+            }
+            let mut prompt_focus = None;
+            if selected
+                && app.input.is_some()
+                && app.view != View::Chunks
+                && (app.view != View::InlineOperations || app.listing.is_empty())
+            {
+                for line in prompt_lines(
+                    app,
+                    &graph.continuation,
+                    area.width.saturating_sub(4) as usize,
+                ) {
+                    prompt_focus = Some(items.len());
+                    targets.push((i, None));
+                    items.push(ListItem::new(line));
+                }
+            }
+            if selected && let Some((action, sources, _)) = &app.target {
+                targets.push((i, None));
+                items.push(ListItem::new(format!(
+                    "{}  {action}: {} → {} · {} apply · Esc cancel",
+                    graph.continuation,
+                    sources
+                        .iter()
+                        .map(|s| &s[..s.len().min(8)])
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    &revision.change_id[..revision.change_id.len().min(8)],
+                    app.keys.label("input", "submit")
+                )));
             }
             if selected && app.view == View::InlineOperations {
                 targets.push((i, None));
@@ -2005,6 +2581,17 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                         operation_rows.insert(items.len(), index);
                         targets.push((i, None));
                         items.push(ListItem::new(line));
+                    }
+                    if index == app.browse_index && app.input.is_some() {
+                        for line in prompt_lines(
+                            app,
+                            &format!("{}  {}", graph.continuation, op_graph.continuation),
+                            area.width.saturating_sub(4) as usize,
+                        ) {
+                            prompt_focus = Some(items.len());
+                            targets.push((i, None));
+                            items.push(ListItem::new(line));
+                        }
                     }
                 }
             }
@@ -2063,6 +2650,81 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                     }
                 }
             }
+            if selected
+                && app.view == View::Chunks
+                && let Some(editor) = &app.chunks
+            {
+                targets.push((i, None));
+                items.push(ListItem::new(format!(
+                    "{}  Hunks · {} · {} mark · {} restore · {} split",
+                    graph.continuation,
+                    editor.path,
+                    app.keys.label("chunks", "select"),
+                    app.keys.label("chunks", "restore"),
+                    app.keys.label("chunks", "split")
+                )));
+                if let Some(session) = &editor.session {
+                    for (index, hunk) in session.hunks().iter().enumerate() {
+                        if index == editor.index {
+                            selected_row = Some(
+                                items.len()
+                                    + editor
+                                        .line_offset
+                                        .min(hunk.patch.lines().count().saturating_sub(1)),
+                            );
+                        }
+                        for (line_number, text) in hunk.patch.lines().enumerate() {
+                            chunk_rows.insert(items.len(), (index, line_number));
+                            let color = if text.starts_with('+') {
+                                Color::Green
+                            } else if text.starts_with('-') {
+                                Color::Red
+                            } else {
+                                Color::Cyan
+                            };
+                            targets.push((i, None));
+                            items.push(ListItem::new(Line::from(vec![
+                                Span::styled(
+                                    format!(
+                                        "{}  {} ",
+                                        graph.continuation,
+                                        if line_number == 0 && editor.selected.contains(&index) {
+                                            "[x]"
+                                        } else if line_number == 0 {
+                                            "[ ]"
+                                        } else {
+                                            "   "
+                                        }
+                                    ),
+                                    Style::default().fg(Color::Green),
+                                ),
+                                Span::styled(text.to_owned(), Style::default().fg(color)),
+                            ])));
+                        }
+                        if index == editor.index && app.input.is_some() {
+                            for line in prompt_lines(
+                                app,
+                                &graph.continuation,
+                                area.width.saturating_sub(4) as usize,
+                            ) {
+                                prompt_focus = Some(items.len());
+                                targets.push((i, None));
+                                items.push(ListItem::new(line));
+                            }
+                        }
+                    }
+                } else {
+                    targets.push((i, None));
+                    items.push(ListItem::new(format!(
+                        "{}  {}",
+                        graph.continuation,
+                        editor.error.as_deref().unwrap_or("Loading hunks…")
+                    )));
+                }
+            }
+            if let Some(row) = prompt_focus {
+                selected_row = Some(row);
+            }
             if let Some(boundary) = &graph.boundary {
                 targets.push((i, None));
                 items.push(ListItem::new(format!(
@@ -2086,6 +2748,18 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
         .take(area.height.saturating_sub(2) as usize)
         .enumerate()
     {
+        if let Some((index, offset)) = chunk_rows.get(&(row + app.graph_selection.offset())) {
+            app.chunk_hit_rows.push((
+                ratatui::layout::Rect::new(
+                    area.x + 1,
+                    area.y + 1 + row as u16,
+                    area.width.saturating_sub(2),
+                    1,
+                ),
+                *index,
+                *offset,
+            ));
+        }
         if let Some(index) = operation_rows.get(&(row + app.graph_selection.offset())) {
             app.operation_hit_rows.push((
                 ratatui::layout::Rect::new(
@@ -2466,6 +3140,7 @@ mod tests {
                 id: format!("{i:012x}"),
                 label: format!("operation-{i}"),
                 operation: Some(crate::operations::Entry {
+                    prefix_len: 12,
                     current: i == 0,
                     parents: if i + 1 < count {
                         vec![format!("{:012x}", i + 1)]
@@ -2590,6 +3265,165 @@ mod tests {
                     .any(|line| line.contains("000000000000") && line.contains('▸'))
             );
         }
+    }
+
+    #[test]
+    fn operation_ids_highlight_only_the_unique_prefix() {
+        let mut rows = operation_fixture(1);
+        rows[0].operation.as_mut().unwrap().prefix_len = 2;
+        let graph = crate::operations::graph(&rows);
+        let lines = operation_lines(&rows[0], &graph[0], "");
+        let prefix = lines[0].spans.iter().find(|s| s.content == "00").unwrap();
+        let suffix = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content == "0000000000")
+            .unwrap();
+        assert_eq!(prefix.style.fg, Some(Color::LightBlue));
+        assert!(prefix.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(suffix.style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn action_prompts_and_rebase_destinations_are_inline() {
+        let mut app = key_fixture();
+        let before = rendered_rows(&mut app, 40);
+        let parent_before = before
+            .iter()
+            .position(|line| line.contains("other") && line.contains("parent"))
+            .unwrap();
+        press(&mut app, KeyCode::Char('B'));
+        let rows = rendered_rows(&mut app, 40);
+        let prompt = rows
+            .iter()
+            .position(|line| line.contains("Set bookmark"))
+            .unwrap();
+        let parent = rows
+            .iter()
+            .position(|line| line.contains("other") && line.contains("parent"))
+            .unwrap();
+        assert!(prompt < parent && parent > parent_before);
+        assert!(rows[prompt].contains('│'));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('j'));
+        let rows = rendered_rows(&mut app, 40);
+        assert!(
+            rows.iter()
+                .any(|line| line.contains("match-on") && line.contains("[rebase source]"))
+        );
+        assert!(
+            rows.iter()
+                .any(|line| line.contains("other") && line.contains("[rebase destination]"))
+        );
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('a'));
+        let rows = rendered_rows(&mut app, 40);
+        let prompt = rows
+            .iter()
+            .position(|line| line.contains("Confirm abandon"))
+            .unwrap();
+        let next = rows
+            .iter()
+            .position(|line| line.contains("match-tw"))
+            .unwrap();
+        assert!(prompt < next);
+    }
+
+    #[test]
+    fn footer_hints_follow_mode_overrides_and_prompt_state() {
+        let mut app = key_fixture();
+        assert!(footer_hints(&app, 200).to_string().contains("l files"));
+        app.view = View::Files;
+        let files = footer_hints(&app, 200).to_string();
+        assert!(files.contains("i hunks") && files.contains("r restore"));
+        assert!(!files.contains("describe"));
+        app.view = View::Chunks;
+        assert!(!footer_hints(&app, 200).to_string().contains("restore"));
+        for key in ['r', 's'] {
+            assert!(matches!(press(&mut app, KeyCode::Char(key)), Effect::None));
+            assert!(app.input.is_none());
+        }
+        app.view = View::Operations;
+        app.listing = operation_fixture(1);
+        assert!(
+            !footer_hints(&app, 200)
+                .to_string()
+                .contains("snapshot diff")
+        );
+        app.listing[0].operation.as_mut().unwrap().snapshot = true;
+        app.keys
+            .merge("[operations]\ndiff=['x']\noperation_restore=[]")
+            .unwrap();
+        let hints = footer_hints(&app, 200);
+        assert!(hints.to_string().contains("x snapshot diff"));
+        assert!(!hints.to_string().contains("restore operation"));
+        let key = hints.spans.iter().find(|span| span.content == "x").unwrap();
+        assert_eq!(key.style.fg, Some(Color::LightCyan));
+        assert!(key.style.add_modifier.contains(Modifier::BOLD));
+        let action = hints
+            .spans
+            .iter()
+            .find(|span| span.content == " snapshot diff")
+            .unwrap();
+        assert_eq!(action.style.fg, Some(Color::DarkGray));
+        assert!(!action.style.add_modifier.contains(Modifier::BOLD));
+        app.start_input("abandon", "Confirm abandon", String::new(), true);
+        let hints = footer_hints(&app, 200).to_string();
+        assert!(hints.contains("enter confirm") && hints.contains("esc cancel"));
+        assert!(!hints.contains("snapshot diff"));
+        app.input = None;
+        app.target = Some(("rebase".into(), vec!["child".into()], vec![]));
+        assert!(footer_hints(&app, 200).to_string().contains("destination"));
+        for width in [1, 12, 40, 80] {
+            assert!(footer_hints(&app, width).width() <= width);
+        }
+    }
+
+    #[test]
+    fn inline_hunks_capture_selection_and_confirmation() {
+        let mut app = key_fixture();
+        app.view = View::Chunks;
+        app.chunks = Some(ChunkEditor {
+            line_offset: 0,
+            id: "child".into(),
+            path: "file.txt".into(),
+            index: 0,
+            selected: Default::default(),
+            error: None,
+            session: Some(crate::chunks::Session {
+                commit_id: "child".into(),
+                change_id: "match-one".into(),
+                path: "file.txt".into(),
+                before: Some(crate::chunks::TextFile {
+                    text: "old\nkeep\nold2".into(),
+                    executable: false,
+                }),
+                after: Some(crate::chunks::TextFile {
+                    text: "new\nkeep\nnew2".into(),
+                    executable: false,
+                }),
+            }),
+        });
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('v'));
+        assert_eq!(app.chunks.as_ref().unwrap().selected, [1].into());
+        let rows = rendered_rows(&mut app, 40);
+        assert!(rows.iter().any(|line| line.contains("Hunks · file.txt")));
+        assert!(rows.iter().any(|line| line.contains("[x]")));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.input.as_ref().unwrap().confirm);
+        assert!(
+            rendered_rows(&mut app, 40)
+                .iter()
+                .any(|line| line.contains("Restore 1 selected hunk"))
+        );
+        let effect = press(&mut app, KeyCode::Enter);
+        let Effect::Request(crate::live::Request::ApplyChunks(request)) = effect else {
+            panic!("expected hunk application");
+        };
+        assert_eq!(request.selected, [1].into());
+        assert_eq!(request.action, crate::chunks::Action::Restore);
     }
 
     #[test]

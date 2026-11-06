@@ -1,4 +1,5 @@
 mod browser;
+mod chunks;
 mod commands;
 mod graph;
 mod input;
@@ -9,6 +10,7 @@ mod preview;
 mod repository;
 mod settings;
 mod snapshot;
+mod theme;
 mod ui;
 
 use anyhow::{Result, bail};
@@ -30,6 +32,18 @@ struct Args {
     /// Explicit keybinds.toml (otherwise global and repository files are layered)
     #[arg(long)]
     keybinds: Option<PathBuf>,
+    /// Theme: default, dark, light, or a theme.toml path
+    #[arg(long)]
+    theme: Option<String>,
+    /// Validate and print the effective theme
+    #[arg(long)]
+    check_theme: bool,
+    #[arg(long, hide = true, num_args = 3)]
+    chunk_tool: Option<Vec<PathBuf>>,
+    #[arg(long, hide = true, num_args = 2)]
+    chunks: Option<Vec<String>>,
+    #[arg(long, hide = true)]
+    apply_hunks: Option<PathBuf>,
     /// Validate bindings and print effective action bindings
     #[arg(long)]
     check_keybinds: bool,
@@ -55,6 +69,29 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(paths) = args.chunk_tool {
+        return chunks::edit(&paths[0], &paths[1], &paths[2]);
+    }
+    if let Some(path) = args.apply_hunks {
+        let request = serde_json::from_slice(&std::fs::read(path)?)?;
+        println!("{}", chunks::apply(&args.repository, &request)?);
+        return Ok(());
+    }
+    if let Some(values) = args.chunks {
+        let mut repo = repository::Repository::open(&args.repository, args.limit as usize)?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(repo.refresh(true))?;
+        println!(
+            "{}",
+            serde_json::to_string(&runtime.block_on(repo.chunks(&values[0], &values[1]))?)?
+        );
+        return Ok(());
+    }
+    let theme = theme::Theme::load(&args.repository, args.theme.as_deref())?;
+    if args.check_theme {
+        println!("{}", toml::to_string_pretty(&theme)?);
+        return Ok(());
+    }
     let keys = keybinds::Keybinds::load(&args.repository, args.keybinds.as_deref())?;
     if args.check_keybinds {
         println!("{}", keys.help());
@@ -97,6 +134,9 @@ fn main() -> Result<()> {
     if args.watch_json {
         for update in &live.updates {
             let value = match update {
+                live::Update::Chunks { id, path, result } => {
+                    serde_json::json!({"type":"chunks","id":id,"path":path,"result":result})
+                }
                 live::Update::OperationDiff { id, result } => {
                     serde_json::json!({"type":"operation_diff","id":id,"result":result})
                 }
@@ -125,6 +165,6 @@ fn main() -> Result<()> {
         }
         Ok(())
     } else {
-        ui::run(live, keys)
+        ui::run(live, keys, theme, args.theme)
     }
 }

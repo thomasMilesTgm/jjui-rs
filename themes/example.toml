@@ -1,0 +1,22 @@
+# Use with --theme themes/example.toml, or copy to ~/.config/jjui-rs/theme.toml.
+# Reload with gt. Omitted values retain the defaults.
+foreground = "#d8dee9"
+background = "#20242c"
+selection = "#3b4252"
+hint_key = "#88c0d0"
+hint_action = "#8490a4"
+hint_separator = "#616e88"
+
+[palette]
+blue = "#81a1c1"
+light_blue = "#88c0d0"
+magenta = "#b48ead"
+light_magenta = "#c79fba"
+green = "#a3be8c"
+light_green = "#b3ce9c"
+red = "#bf616a"
+light_red = "#d57780"
+yellow = "#ebcb8b"
+cyan = "#8fbcbb"
+light_cyan = "#9fcccb"
+dark_gray = "#8490a4"
