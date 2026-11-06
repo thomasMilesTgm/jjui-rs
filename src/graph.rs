@@ -130,6 +130,7 @@ mod tests {
             author: String::new(),
             bookmarks: vec![],
             working_copy: false,
+            ..Revision::default()
         }
     }
     #[test]

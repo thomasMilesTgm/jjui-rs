@@ -1432,6 +1432,139 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
     }
 }
 
+// Keep ID disambiguation independent of the visible graph window. jj-lib supplies
+// repository-wide prefix lengths; eight characters is jj's default display width.
+fn log_id(id: &str, prefix_len: usize, color: Color) -> Vec<Span<'static>> {
+    let end = id.len().min(prefix_len.max(8));
+    let prefix = prefix_len.min(end);
+    vec![
+        Span::styled(
+            id[..prefix].to_owned(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            id[prefix..end].to_owned(),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]
+}
+
+fn revision_header(
+    revision: &crate::repository::Revision,
+    node: &str,
+    marked: bool,
+) -> Line<'static> {
+    let wc = revision.working_copy;
+    let mut spans = vec![Span::styled(
+        node.to_owned(),
+        Style::default().fg(Color::Green),
+    )];
+    spans.extend(log_id(
+        &revision.change_id,
+        revision.change_prefix_len,
+        if wc {
+            Color::LightMagenta
+        } else {
+            Color::Magenta
+        },
+    ));
+    spans.push(Span::raw(" "));
+    if revision.root {
+        spans.push(Span::styled("root() ", Style::default().fg(Color::Green)));
+    } else {
+        spans.push(Span::styled(
+            if revision.author_email.is_empty() {
+                "(no email set)".into()
+            } else {
+                revision.author_email.clone()
+            },
+            Style::default().fg(if revision.author_email.is_empty() {
+                Color::Red
+            } else {
+                Color::Yellow
+            }),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            revision.timestamp.clone(),
+            Style::default().fg(if wc { Color::LightCyan } else { Color::Cyan }),
+        ));
+        spans.push(Span::raw(" "));
+        if !revision.bookmarks.is_empty() {
+            spans.push(Span::styled(
+                format!("{} ", revision.bookmarks.join(" ")),
+                Style::default().fg(if wc {
+                    Color::LightMagenta
+                } else {
+                    Color::Magenta
+                }),
+            ));
+        }
+    }
+    spans.extend(log_id(
+        &revision.commit_id,
+        revision.commit_prefix_len,
+        if wc { Color::LightBlue } else { Color::Blue },
+    ));
+    if revision.root && !revision.bookmarks.is_empty() {
+        spans.push(Span::styled(
+            format!(" {}", revision.bookmarks.join(" ")),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    if revision.conflict {
+        spans.push(Span::styled(
+            " (conflict)",
+            Style::default().fg(if wc { Color::LightRed } else { Color::Red }),
+        ));
+    }
+    if marked {
+        spans.push(Span::styled(
+            " [selected]",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    Line::from(spans).style(if wc {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    })
+}
+
+fn revision_description(revision: &crate::repository::Revision, edge: &str) -> Line<'static> {
+    let green = if revision.working_copy {
+        Color::LightGreen
+    } else {
+        Color::Green
+    };
+    let mut spans = vec![Span::styled(
+        edge.to_owned(),
+        Style::default().fg(Color::Green),
+    )];
+    if revision.empty {
+        spans.push(Span::styled("(empty) ", Style::default().fg(green)));
+    }
+    spans.push(
+        match revision
+            .description
+            .lines()
+            .next()
+            .filter(|line| !line.is_empty())
+        {
+            Some(description) => Span::raw(description.to_owned()),
+            None => Span::styled(
+                "(no description set)",
+                Style::default().fg(if revision.empty { green } else { Color::Yellow }),
+            ),
+        },
+    );
+    Line::from(spans).style(if revision.working_copy {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    })
+}
+
 fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
     let mut items = Vec::new();
     let mut selected_row = None;
@@ -1450,42 +1583,17 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
             }
             targets.push((i, None));
             items.push(
-                ListItem::new(Line::from(vec![
-                    Span::styled(graph.node.clone(), Style::default().fg(Color::Green)),
-                    Span::styled(
-                        short(&revision.change_id).to_owned(),
-                        Style::default().fg(Color::Magenta),
-                    ),
-                    Span::raw(format!(
-                        " {}{} ",
-                        short(&revision.commit_id),
-                        if app.marked.contains(&revision.commit_id) {
-                            " [selected]"
-                        } else {
-                            ""
-                        }
-                    )),
-                    Span::styled(
-                        revision.bookmarks.join(" "),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                ]))
+                ListItem::new(revision_header(
+                    revision,
+                    &graph.node,
+                    app.marked.contains(&revision.commit_id),
+                ))
                 .style(style),
             );
-            let description = revision
-                .description
-                .lines()
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("(no description)");
-            targets.push((i, None));
-            items.push(
-                ListItem::new(Line::from(vec![
-                    Span::styled(graph.edge.clone(), Style::default().fg(Color::Green)),
-                    Span::raw(description.to_owned()),
-                ]))
-                .style(style),
-            );
+            if !revision.root {
+                targets.push((i, None));
+                items.push(ListItem::new(revision_description(revision, &graph.edge)).style(style));
+            }
             if selected && app.view == View::Files {
                 let inline = |text: String| {
                     ListItem::new(Line::from(vec![
@@ -1553,7 +1661,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
     frame.render_stateful_widget(
         List::new(items)
             .block(Block::bordered().title(format!(" Revisions · /{} ", app.filter)))
-            .highlight_style(Style::default().bg(Color::DarkGray))
+            .highlight_style(Style::default().bg(Color::Indexed(236)))
             .highlight_symbol("▸ "),
         area,
         &mut app.graph_selection,
@@ -1645,7 +1753,56 @@ mod tests {
             author: String::new(),
             bookmarks: vec![],
             working_copy: false,
+            ..Revision::default()
         }
+    }
+
+    #[test]
+    fn log_metadata_matches_jj_compact_content_and_colors() {
+        let mut revision = Revision {
+            change_id: "yqkuklmmzzzz".into(),
+            commit_id: "03a6cacbffff".into(),
+            change_prefix_len: 2,
+            commit_prefix_len: 2,
+            author_email: "tom@ai-nc.com".into(),
+            timestamp: "2026-11-06 11:18:25".into(),
+            ..Revision::default()
+        };
+        let line = revision_header(&revision, "○ ", false);
+        assert_eq!(
+            line.to_string(),
+            "○ yqkuklmm tom@ai-nc.com 2026-11-06 11:18:25 03a6cacb"
+        );
+        for (text, color, bold) in [
+            ("yq", Color::Magenta, true),
+            ("kuklmm", Color::DarkGray, false),
+            ("tom@ai-nc.com", Color::Yellow, false),
+            ("2026-11-06 11:18:25", Color::Cyan, false),
+            ("03", Color::Blue, true),
+            ("a6cacb", Color::DarkGray, false),
+        ] {
+            let span = line.spans.iter().find(|span| span.content == text).unwrap();
+            assert_eq!(span.style.fg, Some(color));
+            assert_eq!(span.style.add_modifier.contains(Modifier::BOLD), bold);
+        }
+        revision.working_copy = true;
+        revision.empty = true;
+        let line = revision_header(&revision, "@ ", false);
+        assert!(line.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[1].style.fg, Some(Color::LightMagenta));
+        assert_eq!(
+            revision_description(&revision, "│ ").to_string(),
+            "│ (empty) (no description set)"
+        );
+        revision.root = true;
+        assert_eq!(
+            revision_header(&revision, "◆ ", false).to_string(),
+            "◆ yqkuklmm root() 03a6cacb"
+        );
+        assert_eq!(
+            log_id("0123456789abcdef", 10, Color::Blue)[0].content,
+            "0123456789"
+        );
     }
 
     #[test]
@@ -1845,7 +2002,7 @@ mod tests {
         let before = rendered_rows(&mut app, 30);
         let parent_before = before
             .iter()
-            .position(|line| line.contains("other parent"))
+            .position(|line| line.contains("other") && line.contains("parent"))
             .unwrap();
         press(&mut app, KeyCode::Char('l'));
         let expanded = rendered_rows(&mut app, 30);
@@ -1855,11 +2012,11 @@ mod tests {
             .unwrap();
         let parent_after = expanded
             .iter()
-            .position(|line| line.contains("other parent"))
+            .position(|line| line.contains("other") && line.contains("parent"))
             .unwrap();
         let child_row = expanded
             .iter()
-            .position(|line| line.contains("match-one child"))
+            .position(|line| line.contains("match-on") && line.contains("child"))
             .unwrap();
         assert!(child_row < file_row && file_row < parent_after);
         assert_eq!(parent_after, parent_before + 2);
@@ -1904,9 +2061,9 @@ mod tests {
         press(&mut app, KeyCode::Left);
         let collapsed = rendered_rows(&mut app, 12);
         assert!(
-            collapsed
-                .iter()
-                .any(|line| line.contains("match-one child") && line.contains('▸'))
+            collapsed.iter().any(|line| line.contains("match-on")
+                && line.contains("child")
+                && line.contains('▸'))
         );
         assert!(!collapsed.iter().any(|line| line.contains("file-")));
     }

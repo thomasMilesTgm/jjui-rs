@@ -16,13 +16,20 @@ use jj_lib::{
 };
 use serde::Serialize;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Revision {
     pub commit_id: String,
     pub change_id: String,
     pub parents: Vec<String>,
     pub description: String,
     pub author: String,
+    pub author_email: String,
+    pub timestamp: String,
+    pub change_prefix_len: usize,
+    pub commit_prefix_len: usize,
+    pub root: bool,
+    pub empty: bool,
+    pub conflict: bool,
     pub bookmarks: Vec<String>,
     pub working_copy: bool,
 }
@@ -141,6 +148,26 @@ impl Repository {
                 parents: commit.parent_ids().iter().map(ObjectId::hex).collect(),
                 description: commit.description().to_owned(),
                 author: format!("{} <{}>", commit.author().name, commit.author().email),
+                author_email: commit.author().email.clone(),
+                timestamp: chrono::DateTime::from_timestamp_millis(
+                    commit.committer().timestamp.timestamp.0,
+                )
+                .map(|time| {
+                    time.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "(invalid timestamp)".into()),
+                change_prefix_len: repo
+                    .shortest_unique_change_id_prefix_len(commit.change_id())
+                    .await?,
+                commit_prefix_len: repo
+                    .index()
+                    .shortest_unique_commit_id_prefix_len(&id)
+                    .await?,
+                root: id == *repo.store().root_commit_id(),
+                empty: commit.is_empty(repo.as_ref()).await?,
+                conflict: commit.has_conflict(),
                 bookmarks,
                 working_copy: wc == Some(&id),
             });

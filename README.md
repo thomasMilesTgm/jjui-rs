@@ -109,6 +109,8 @@ cargo run -- --auto-snapshot --once
 
 The default graph limit is 200 revisions. Quick search and parent/child jumps operate within that window. `L`/`-r` evaluates across the repository before applying the limit. `~` marks omitted ancestry; `╪` marks unrelated crossing edges.
 
+Graph text follows jj's default compact log style: change ID, author email, local committer timestamp, bookmarks, and commit ID, followed by the description. IDs show at least eight characters, with repository-wide unique prefixes in bold magenta/blue and the remainder in gray. Emails are yellow, timestamps cyan, and working-copy text is bold with brighter colors. Empty changes, conflicts, missing descriptions, and the root commit have jj-style labels. This uses native metadata and fixed default styling; custom jj log templates and color overrides are not loaded.
+
 ## Current limits
 
 This implements the core workflows above, not every jjui extension or advanced mode. Rebase insertion modes, annotation/range-diff views, Lua plugins, custom themes, and interactive chunk selection inside the TUI are not implemented. Interactive split/diff editing delegates to configured jj tools. Operation history shows the newest 200 operations; command history lasts for the current session. There is no mouse drag/range selection.

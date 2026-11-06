@@ -109,6 +109,36 @@ fn reads_without_jj_and_does_not_snapshot_working_copy() {
         String::from_utf8_lossy(&output.stderr)
     );
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let current = value["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["working_copy"] == true)
+        .unwrap();
+    assert_eq!(current["author_email"], "test@example.org");
+    chrono::NaiveDateTime::parse_from_str(
+        current["timestamp"].as_str().unwrap(),
+        "%Y-%m-%d %H:%M:%S",
+    )
+    .unwrap();
+    assert!(current["change_prefix_len"].as_u64().unwrap() > 0);
+    assert!(current["commit_prefix_len"].as_u64().unwrap() > 0);
+    assert_eq!(current["empty"], true);
+    assert_eq!(current["root"], false);
+    let limited = viewer(temp.path())
+        .args(["--once", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(limited.status.success());
+    let limited: Value = serde_json::from_slice(&limited.stdout).unwrap();
+    assert_eq!(
+        limited["revisions"][0]["change_prefix_len"],
+        current["change_prefix_len"]
+    );
+    assert_eq!(
+        limited["revisions"][0]["commit_prefix_len"],
+        current["commit_prefix_len"]
+    );
     assert!(
         value["revisions"]
             .as_array()
