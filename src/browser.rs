@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use futures::StreamExt;
 use jj_lib::{
     backend::CommitId,
     object_id::ObjectId,
@@ -10,6 +9,7 @@ use serde::Serialize;
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum Query {
     Operations,
+    CommitOperations(String),
     Bookmarks,
     Files(String),
 }
@@ -17,6 +17,7 @@ pub enum Query {
 pub struct Row {
     pub id: String,
     pub label: String,
+    pub operation: Option<crate::operations::Entry>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Listing {
@@ -27,29 +28,17 @@ pub struct Listing {
 pub async fn load(repo: &ReadonlyRepo, query: Query) -> Result<Listing> {
     let mut rows = Vec::new();
     match &query {
-        Query::Operations => {
-            let mut stream = Box::pin(jj_lib::op_walk::walk_ancestors(&[repo.operation().clone()]));
-            while let Some(op) = stream.next().await {
-                let op = op?;
-                let m = op.metadata();
-                rows.push(Row {
-                    id: op.id().hex(),
-                    label: format!(
-                        "{:.12}  {}@{}  {}",
-                        op.id().hex(),
-                        m.username,
-                        m.hostname,
-                        m.description
-                    ),
-                });
-                if rows.len() >= 200 {
-                    break;
-                }
-            }
+        Query::Operations | Query::CommitOperations(_) => {
+            let commit = match &query {
+                Query::CommitOperations(id) => Some(id.as_str()),
+                _ => None,
+            };
+            rows = crate::operations::load(repo, commit).await?;
         }
         Query::Bookmarks => {
             for (name, target) in repo.view().local_bookmarks() {
                 rows.push(Row {
+                    operation: None,
                     id: name.as_str().into(),
                     label: format!(
                         "{}  {}",
@@ -64,6 +53,7 @@ pub async fn load(repo: &ReadonlyRepo, query: Query) -> Result<Listing> {
             }
             for (symbol, remote) in repo.view().all_remote_bookmarks() {
                 rows.push(Row {
+                    operation: None,
                     id: symbol.to_string(),
                     label: format!(
                         "{}  {}",
@@ -83,6 +73,7 @@ pub async fn load(repo: &ReadonlyRepo, query: Query) -> Result<Listing> {
             for (path, value) in commit.tree().entries() {
                 value?;
                 rows.push(Row {
+                    operation: None,
                     id: path.as_internal_file_string().into(),
                     label: path.as_internal_file_string().into(),
                 });

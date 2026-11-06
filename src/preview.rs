@@ -4,6 +4,7 @@ use jj_lib::{
     backend::{CommitId, MergedTreeValue, TreeValue},
     diff::{ContentDiff, DiffHunkKind},
     matchers::EverythingMatcher,
+    merged_tree::MergedTree,
     object_id::ObjectId,
     repo::{ReadonlyRepo, Repo},
     repo_path::RepoPath,
@@ -56,9 +57,28 @@ pub async fn load(repo: &ReadonlyRepo, id: &str) -> Result<Preview> {
     let commit = repo.store().get_commit_async(&id).await?;
     let before = commit.parent_tree(repo).await?;
     let after = commit.tree();
-    let mut entries = before.diff_stream(&after, &EverythingMatcher);
+    diff_trees(repo, &before, &after, id.hex()).await
+}
+
+pub async fn between_commits(
+    repo: &ReadonlyRepo,
+    before: &CommitId,
+    after: &CommitId,
+) -> Result<Preview> {
+    let before = repo.store().get_commit_async(before).await?;
+    let after = repo.store().get_commit_async(after).await?;
+    diff_trees(repo, &before.tree(), &after.tree(), after.id().hex()).await
+}
+
+async fn diff_trees(
+    repo: &ReadonlyRepo,
+    before: &MergedTree,
+    after: &MergedTree,
+    id: String,
+) -> Result<Preview> {
+    let mut entries = before.diff_stream(after, &EverythingMatcher);
     let mut preview = Preview {
-        commit_id: id.hex(),
+        commit_id: id,
         files: Vec::new(),
         truncated: false,
     };

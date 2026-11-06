@@ -12,10 +12,15 @@ use std::{
 pub enum Request {
     Revset(String),
     Listing(crate::browser::Query),
+    OperationDiff(String),
     Command(crate::commands::CommandSpec),
 }
 
 pub enum Update {
+    OperationDiff {
+        id: String,
+        result: Result<String, String>,
+    },
     Listing(Result<crate::browser::Listing, String>),
     CommandFinished {
         command: String,
@@ -145,6 +150,12 @@ pub fn start(
                             Err(error) => Update::Error(format!("{error:#}")),
                         }
                     }
+                    Request::OperationDiff(id) => Update::OperationDiff {
+                        result: runtime
+                            .block_on(repo.operation_diff(&id))
+                            .map_err(|e| format!("{e:#}")),
+                        id,
+                    },
                     Request::Listing(query) => Update::Listing(
                         runtime
                             .block_on(repo.listing(query))

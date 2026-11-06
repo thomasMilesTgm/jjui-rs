@@ -4,6 +4,7 @@ mod graph;
 mod input;
 mod keybinds;
 mod live;
+mod operations;
 mod preview;
 mod repository;
 mod settings;
@@ -96,6 +97,9 @@ fn main() -> Result<()> {
     if args.watch_json {
         for update in &live.updates {
             let value = match update {
+                live::Update::OperationDiff { id, result } => {
+                    serde_json::json!({"type":"operation_diff","id":id,"result":result})
+                }
                 live::Update::Listing(result) => {
                     serde_json::json!({"type":"listing","result":result})
                 }

@@ -25,6 +25,10 @@ struct App {
     follow_working_copy: bool,
     output: String,
     listing: Vec<crate::browser::Row>,
+    operation_graph: Vec<crate::graph::GraphRow>,
+    operation_diff: Option<OperationDiff>,
+    operation_selection: ListState,
+    operation_hit_rows: Vec<(ratatui::layout::Rect, usize)>,
     browse_index: usize,
     file_filter: String,
     marked_files: HashSet<String>,
@@ -53,7 +57,7 @@ struct App {
     marked: HashSet<String>,
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 enum View {
     #[default]
     Revisions,
@@ -62,9 +66,17 @@ enum View {
     Bookmarks,
     Help,
     Operations,
+    InlineOperations,
+    OperationDiff,
     Git,
     Text,
     Finder,
+}
+
+struct OperationDiff {
+    id: String,
+    origin: View,
+    result: Option<Result<String, String>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -317,7 +329,7 @@ impl App {
             View::Revisions => "revisions",
             View::Files => "files",
             View::Bookmarks => "bookmarks",
-            View::Operations => "operations",
+            View::Operations | View::InlineOperations => "operations",
             View::Git => "git",
             View::Finder => "finder",
             _ => "view",
@@ -325,6 +337,45 @@ impl App {
         let Some(action) = self.keys.resolve(scope, key) else {
             return Effect::None;
         };
+        if action == "diff" && matches!(self.view, View::Operations | View::InlineOperations) {
+            let Some(row) = self.listing.get(self.browse_index) else {
+                return Effect::None;
+            };
+            if !row.operation.as_ref().is_some_and(|op| op.snapshot) {
+                self.notice = Some("Diff is available for snapshot working-copy operations".into());
+                return Effect::None;
+            }
+            let id = row.id.clone();
+            self.operation_diff = Some(OperationDiff {
+                id: id.clone(),
+                origin: self.view,
+                result: None,
+            });
+            self.view = View::OperationDiff;
+            self.scroll = 0;
+            self.notice = None;
+            self.error = None;
+            self.busy = true;
+            return Effect::Request(crate::live::Request::OperationDiff(id));
+        }
+        if action == "cancel" && self.view == View::OperationDiff {
+            self.view = self
+                .operation_diff
+                .take()
+                .map_or(View::Revisions, |diff| diff.origin);
+            self.scroll = 0;
+            let query = if self.view == View::Operations {
+                Some(crate::browser::Query::Operations)
+            } else {
+                self.selected_id()
+                    .map(|id| crate::browser::Query::CommitOperations(id.into()))
+            };
+            if let Some(query) = query {
+                self.busy = true;
+                return Effect::Request(crate::live::Request::Listing(query));
+            }
+            return Effect::None;
+        }
         if self.pending_command
             && matches!(
                 action.as_str(),
@@ -431,7 +482,10 @@ impl App {
             }
             return Effect::None;
         }
-        if matches!(self.view, View::Operations | View::Bookmarks | View::Finder) {
+        if matches!(
+            self.view,
+            View::Operations | View::InlineOperations | View::Bookmarks | View::Finder
+        ) {
             let count = self.listing_rows().len();
             match action.as_str() {
                 "down" => {
@@ -551,14 +605,26 @@ impl App {
                 }
                 return Effect::None;
             }
-            "operations" => {
-                self.view = View::Operations;
+            "operations" | "full_operations" => {
+                if action == "operations" && self.view == View::InlineOperations {
+                    self.view = View::Revisions;
+                    return Effect::None;
+                }
+                let query = if action == "full_operations" {
+                    self.view = View::Operations;
+                    crate::browser::Query::Operations
+                } else if let Some(id) = self.selected_id().map(str::to_owned) {
+                    self.view = View::InlineOperations;
+                    crate::browser::Query::CommitOperations(id)
+                } else {
+                    return Effect::None;
+                };
+                self.operation_graph.clear();
+                self.operation_selection = ListState::default();
                 self.listing.clear();
                 self.browse_index = 0;
                 self.busy = true;
-                return Effect::Request(crate::live::Request::Listing(
-                    crate::browser::Query::Operations,
-                ));
+                return Effect::Request(crate::live::Request::Listing(query));
             }
             "bookmarks" => {
                 self.view = View::Bookmarks;
@@ -623,7 +689,12 @@ impl App {
             "operation_restore" | "bookmark_delete" | "bookmark_track" | "bookmark_untrack" => {
                 if let Some(row) = self.listing_rows().get(self.browse_index) {
                     let value = row.id.clone();
-                    self.start_input(&action, &format!("Confirm {action}: {value}"), value, true);
+                    let label = if action == "operation_restore" {
+                        format!("Restore entire repository to operation {value}")
+                    } else {
+                        format!("Confirm {action}: {value}")
+                    };
+                    self.start_input(&action, &label, value, true);
                 }
                 return Effect::None;
             }
@@ -735,6 +806,14 @@ impl App {
         }
         match mouse.kind {
             event::MouseEventKind::Down(event::MouseButton::Left) => {
+                if let Some((_, index)) = self
+                    .operation_hit_rows
+                    .iter()
+                    .find(|(rect, _)| rect.contains((mouse.column, mouse.row).into()))
+                {
+                    self.browse_index = *index;
+                    return;
+                }
                 if let Some((_, revision, file)) = self
                     .hit_rows
                     .iter()
@@ -758,7 +837,13 @@ impl App {
             }
             event::MouseEventKind::ScrollDown | event::MouseEventKind::ScrollUp => {
                 let down = mouse.kind == event::MouseEventKind::ScrollDown;
-                if self.view == View::Files {
+                if matches!(self.view, View::Operations | View::InlineOperations) {
+                    self.browse_index = if down {
+                        (self.browse_index + 1).min(self.listing.len().saturating_sub(1))
+                    } else {
+                        self.browse_index.saturating_sub(1)
+                    };
+                } else if self.view == View::Files {
                     let indices = self.file_indices();
                     if !indices.is_empty() {
                         let i = indices
@@ -782,6 +867,26 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+    fn apply_operation_diff(&mut self, id: &str, result: Result<String, String>) {
+        if self.view == View::OperationDiff
+            && let Some(diff) = &mut self.operation_diff
+            && diff.id == id
+        {
+            diff.result = Some(result);
+        }
+    }
+    fn accepts_listing(&self, query: &crate::browser::Query) -> bool {
+        match query {
+            crate::browser::Query::Bookmarks => self.view == View::Bookmarks,
+            crate::browser::Query::Operations => self.view == View::Operations,
+            crate::browser::Query::CommitOperations(id) => {
+                self.view == View::InlineOperations && self.selected_id() == Some(id)
+            }
+            crate::browser::Query::Files(id) => {
+                self.view == View::Finder && self.selected_id() == Some(id)
+            }
         }
     }
     fn listing_rows(&self) -> Vec<&crate::browser::Row> {
@@ -1035,6 +1140,13 @@ impl App {
         };
         self.selection
             .select((!visible.is_empty()).then_some(selected));
+        if self.view == View::InlineOperations
+            && old.as_ref().map(|(id, _)| id.as_str()) != self.selected_id()
+        {
+            self.listing.clear();
+            self.operation_graph.clear();
+            self.browse_index = 0;
+        }
         self.error = None;
         if self
             .preview
@@ -1061,12 +1173,21 @@ pub fn run(live: Live, keys: crate::keybinds::Keybinds) -> Result<()> {
         loop {
             for update in live.updates.try_iter() {
                 match update {
+                    Update::OperationDiff { id, result } => {
+                        app.busy = false;
+                        app.apply_operation_diff(&id, result);
+                    }
                     Update::Repository(snapshot) => {
                         app.update(snapshot);
-                        if !app.busy {
+                        if !app.busy
+                            || matches!(app.view, View::Operations | View::InlineOperations)
+                        {
                             let query = match app.view {
                                 View::Bookmarks => Some(crate::browser::Query::Bookmarks),
                                 View::Operations => Some(crate::browser::Query::Operations),
+                                View::InlineOperations => app
+                                    .selected_id()
+                                    .map(|id| crate::browser::Query::CommitOperations(id.into())),
                                 View::Finder => app
                                     .selected_id()
                                     .map(|id| crate::browser::Query::Files(id.into())),
@@ -1092,16 +1213,7 @@ pub fn run(live: Live, keys: crate::keybinds::Keybinds) -> Result<()> {
                         app.busy = false;
                         match result {
                             Ok(list) => {
-                                let expected = match &list.query {
-                                    crate::browser::Query::Bookmarks => app.view == View::Bookmarks,
-                                    crate::browser::Query::Operations => {
-                                        app.view == View::Operations
-                                    }
-                                    crate::browser::Query::Files(id) => {
-                                        app.view == View::Finder && app.selected_id() == Some(id)
-                                    }
-                                };
-                                if !expected {
+                                if !app.accepts_listing(&list.query) {
                                     continue;
                                 }
                                 app.notice = None;
@@ -1109,6 +1221,7 @@ pub fn run(live: Live, keys: crate::keybinds::Keybinds) -> Result<()> {
                                     .listing_rows()
                                     .get(app.browse_index)
                                     .map(|r| r.id.clone());
+                                app.operation_graph = crate::operations::graph(&list.rows);
                                 app.listing = list.rows;
                                 app.browse_index = selected
                                     .and_then(|id| {
@@ -1157,7 +1270,8 @@ pub fn run(live: Live, keys: crate::keybinds::Keybinds) -> Result<()> {
                     }
                 }
             }
-            if (app.preview_visible || matches!(app.view, View::Files | View::Diff))
+            if app.view != View::OperationDiff
+                && (app.preview_visible || matches!(app.view, View::Files | View::Diff))
                 && let Some(id) = app.selected_id().map(str::to_owned)
                 && app.requested.as_ref() != Some(&id)
             {
@@ -1250,6 +1364,7 @@ impl Drop for MouseCapture {
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     app.hit_rows.clear();
+    app.operation_hit_rows.clear();
     draw_body(frame, app);
     if let Some(input) = &app.input {
         let area = frame.area();
@@ -1341,7 +1456,11 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
         })),
         footer,
     );
-    if matches!(app.view, View::Bookmarks | View::Operations | View::Finder) {
+    if app.view == View::Operations {
+        draw_operations(frame, body, app);
+        return;
+    }
+    if matches!(app.view, View::Bookmarks | View::Finder) {
         let rows = app.listing_rows();
         let items: Vec<_> = rows
             .iter()
@@ -1370,9 +1489,24 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
         );
         return;
     }
-    if matches!(app.view, View::Diff | View::Help | View::Text | View::Git) {
+    if matches!(
+        app.view,
+        View::Diff | View::OperationDiff | View::Help | View::Text | View::Git
+    ) {
         let (title, text) = match app.view {
             View::Diff => (" Diff ", app.preview_text()),
+            View::OperationDiff => (
+                " Snapshot operation diff ",
+                match app
+                    .operation_diff
+                    .as_ref()
+                    .and_then(|diff| diff.result.as_ref())
+                {
+                    Some(Ok(text)) => text.clone(),
+                    Some(Err(error)) => format!("Cannot load operation diff: {error}"),
+                    None => "Loading operation diff…".into(),
+                },
+            ),
             View::Help => (
                 " Key bindings ",
                 format!(
@@ -1400,7 +1534,7 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
             title,
             &text,
             &mut app.scroll,
-            app.view == View::Diff,
+            matches!(app.view, View::Diff | View::OperationDiff),
         );
         return;
     }
@@ -1565,10 +1699,173 @@ fn revision_description(revision: &crate::repository::Revision, edge: &str) -> L
     })
 }
 
+fn operation_lines(
+    row: &crate::browser::Row,
+    graph: &crate::graph::GraphRow,
+    outer: &str,
+) -> Vec<Line<'static>> {
+    let op = row.operation.as_ref().expect("operation row");
+    let style = if op.current {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let blue = if op.current {
+        Color::LightBlue
+    } else {
+        Color::Blue
+    };
+    let cyan = if op.current {
+        Color::LightCyan
+    } else {
+        Color::Cyan
+    };
+    let mut spans = vec![
+        Span::styled(outer.to_owned(), Style::default().fg(Color::Green)),
+        Span::styled(
+            graph.node.clone(),
+            if op.current {
+                style.fg(Color::Green)
+            } else {
+                Style::default()
+            },
+        ),
+        Span::raw(" "),
+        Span::styled(short(&row.id).to_owned(), Style::default().fg(blue)),
+    ];
+    if op.root {
+        spans.push(Span::styled(" root()", Style::default().fg(Color::Green)));
+        return vec![Line::from(spans).style(style)];
+    }
+    spans.push(Span::styled(
+        format!(" {}", op.user),
+        Style::default().fg(Color::Yellow),
+    ));
+    if let Some(workspace) = &op.workspace {
+        spans.push(Span::styled(
+            format!(" {workspace}@"),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    let elapsed = chrono::Local::now()
+        .timestamp_millis()
+        .saturating_sub(op.end_millis);
+    let when = if elapsed >= 0 {
+        format!("{} ago", operation_duration(elapsed))
+    } else {
+        format!("in {}", operation_duration(elapsed.saturating_abs()))
+    };
+    spans.push(Span::styled(
+        format!(" {when}, lasted {}", operation_duration(op.duration_millis)),
+        Style::default().fg(cyan),
+    ));
+    let mut lines = vec![Line::from(spans).style(style)];
+    lines.push(
+        Line::from(vec![
+            Span::styled(outer.to_owned(), Style::default().fg(Color::Green)),
+            Span::raw(format!("{} ", graph.edge)),
+            Span::raw(op.description.lines().next().unwrap_or_default().to_owned()),
+        ])
+        .style(style),
+    );
+    for attribute in &op.attributes {
+        for text in attribute.lines() {
+            lines.push(
+                Line::from(vec![
+                    Span::styled(outer.to_owned(), Style::default().fg(Color::Green)),
+                    Span::raw(format!("{} ", graph.continuation)),
+                    Span::styled(
+                        text.to_owned(),
+                        Style::default().fg(if op.current {
+                            Color::LightMagenta
+                        } else {
+                            Color::Magenta
+                        }),
+                    ),
+                ])
+                .style(style),
+            );
+        }
+    }
+    if let Some(boundary) = &graph.boundary {
+        lines.push(Line::from(vec![
+            Span::styled(outer.to_owned(), Style::default().fg(Color::Green)),
+            Span::styled(boundary.clone(), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines
+}
+
+fn operation_duration(millis: i64) -> String {
+    let millis = millis.max(0);
+    let (value, unit) = [
+        (31_536_000_000, "year"),
+        (2_592_000_000, "month"),
+        (86_400_000, "day"),
+        (3_600_000, "hour"),
+        (60_000, "minute"),
+        (1_000, "second"),
+        (1, "millisecond"),
+    ]
+    .into_iter()
+    .find(|(scale, _)| millis >= *scale)
+    .map(|(scale, unit)| (millis / scale, unit))
+    .unwrap_or((0, "millisecond"));
+    format!("{value} {unit}{}", if value == 1 { "" } else { "s" })
+}
+
+fn draw_operations(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let mut items = Vec::new();
+    let mut indices = Vec::new();
+    let mut selected = None;
+    for (index, (row, graph)) in app.listing.iter().zip(&app.operation_graph).enumerate() {
+        if index == app.browse_index {
+            selected = Some(items.len());
+        }
+        for line in operation_lines(row, graph, "") {
+            indices.push(index);
+            items.push(ListItem::new(line));
+        }
+    }
+    if items.is_empty() {
+        items.push(ListItem::new(if app.busy {
+            "Loading operations…"
+        } else {
+            "No operations"
+        }));
+    }
+    app.operation_selection.select(selected);
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(Block::bordered().title(" Operations (latest 200) "))
+            .highlight_style(Style::default().bg(Color::Indexed(236)))
+            .highlight_symbol("▸ "),
+        area,
+        &mut app.operation_selection,
+    );
+    for (line, index) in indices
+        .into_iter()
+        .skip(app.operation_selection.offset())
+        .take(area.height.saturating_sub(2) as usize)
+        .enumerate()
+    {
+        app.operation_hit_rows.push((
+            ratatui::layout::Rect::new(
+                area.x + 1,
+                area.y + 1 + line as u16,
+                area.width.saturating_sub(2),
+                1,
+            ),
+            index,
+        ));
+    }
+}
+
 fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
     let mut items = Vec::new();
     let mut selected_row = None;
     let mut targets = Vec::new();
+    let mut operation_rows = std::collections::HashMap::new();
     if let Some(snapshot) = &app.snapshot {
         for (i, revision) in snapshot.revisions.iter().enumerate() {
             let graph = &app.graph[i];
@@ -1593,6 +1890,40 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
             if !revision.root {
                 targets.push((i, None));
                 items.push(ListItem::new(revision_description(revision, &graph.edge)).style(style));
+            }
+            if selected && app.view == View::InlineOperations {
+                targets.push((i, None));
+                selected_row = Some(items.len());
+                items.push(ListItem::new(format!(
+                    "{}  Operations for change {} (latest 200 matches)",
+                    graph.continuation,
+                    &revision.change_id[..revision.change_id.len().min(8)]
+                )));
+                if app.listing.is_empty() {
+                    targets.push((i, None));
+                    items.push(ListItem::new(format!(
+                        "{}  {}",
+                        graph.continuation,
+                        if app.busy {
+                            "Loading operations…"
+                        } else {
+                            "No related operations"
+                        }
+                    )));
+                }
+                for (index, (row, op_graph)) in
+                    app.listing.iter().zip(&app.operation_graph).enumerate()
+                {
+                    if index == app.browse_index {
+                        selected_row = Some(items.len());
+                    }
+                    for line in operation_lines(row, op_graph, &format!("{}  ", graph.continuation))
+                    {
+                        operation_rows.insert(items.len(), index);
+                        targets.push((i, None));
+                        items.push(ListItem::new(line));
+                    }
+                }
             }
             if selected && app.view == View::Files {
                 let inline = |text: String| {
@@ -1672,6 +2003,17 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
         .take(area.height.saturating_sub(2) as usize)
         .enumerate()
     {
+        if let Some(index) = operation_rows.get(&(row + app.graph_selection.offset())) {
+            app.operation_hit_rows.push((
+                ratatui::layout::Rect::new(
+                    area.x + 1,
+                    area.y + 1 + row as u16,
+                    area.width.saturating_sub(2),
+                    1,
+                ),
+                *index,
+            ));
+        }
         app.hit_rows.push((
             ratatui::layout::Rect::new(
                 area.x + 1,
@@ -1985,6 +2327,179 @@ mod tests {
             .chunks(120)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect()
+    }
+
+    fn operation_fixture(count: usize) -> Vec<crate::browser::Row> {
+        (0..count)
+            .map(|i| crate::browser::Row {
+                id: format!("{i:012x}"),
+                label: format!("operation-{i}"),
+                operation: Some(crate::operations::Entry {
+                    current: i == 0,
+                    parents: if i + 1 < count {
+                        vec![format!("{:012x}", i + 1)]
+                    } else {
+                        vec![]
+                    },
+                    user: "tom@host".into(),
+                    workspace: Some("default".into()),
+                    end_millis: chrono::Local::now().timestamp_millis() - 60000,
+                    duration_millis: 7,
+                    description: format!("operation-{i}"),
+                    attributes: vec!["args: jj describe".into()],
+                    ..Default::default()
+                }),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn operations_expand_inline_switch_to_full_and_preserve_selection() {
+        let mut app = key_fixture();
+        let before = rendered_rows(&mut app, 35);
+        let parent_before = before
+            .iter()
+            .position(|line| line.contains("other") && line.contains("parent"))
+            .unwrap();
+        assert_eq!(
+            press(&mut app, KeyCode::Char('o')),
+            Effect::Request(crate::live::Request::Listing(
+                crate::browser::Query::CommitOperations("child".into())
+            ))
+        );
+        assert_eq!(app.view, View::InlineOperations);
+        assert!(!app.accepts_listing(&crate::browser::Query::Operations));
+        assert!(!app.accepts_listing(&crate::browser::Query::CommitOperations("parent".into())));
+        assert!(app.accepts_listing(&crate::browser::Query::CommitOperations("child".into())));
+        app.listing = operation_fixture(2);
+        app.operation_graph = crate::operations::graph(&app.listing);
+        app.busy = false;
+        let expanded = rendered_rows(&mut app, 35);
+        let parent_after = expanded
+            .iter()
+            .position(|line| line.contains("other") && line.contains("parent"))
+            .unwrap();
+        let operation = expanded
+            .iter()
+            .position(|line| line.contains("operation-0"))
+            .unwrap();
+        assert!(operation < parent_after);
+        assert_eq!(parent_after, parent_before + 7);
+        assert!(expanded[operation].contains("│   │"));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.browse_index, 1);
+        assert_eq!(app.selection.selected(), Some(0));
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.input.as_ref().unwrap().text, "000000000001");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.view, View::Revisions);
+        assert_eq!(rendered_rows(&mut app, 35), before);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('O')),
+            Effect::Request(crate::live::Request::Listing(
+                crate::browser::Query::Operations
+            ))
+        );
+        assert_eq!(app.view, View::Operations);
+        assert!(!app.accepts_listing(&crate::browser::Query::CommitOperations("child".into())));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.selection.selected(), Some(0));
+    }
+
+    #[test]
+    fn operation_graph_colors_and_scroll_work_in_both_modes() {
+        let mut app = key_fixture();
+        app.listing = operation_fixture(40);
+        app.operation_graph = crate::operations::graph(&app.listing);
+        let lines = operation_lines(&app.listing[0], &app.operation_graph[0], "");
+        assert!(
+            lines[0]
+                .to_string()
+                .starts_with("@  000000000000 tom@host default@ ")
+        );
+        assert!(lines[0].to_string().ends_with(", lasted 7 milliseconds"));
+        for (text, color) in [
+            ("000000000000", Color::LightBlue),
+            (" tom@host", Color::Yellow),
+            (" default@", Color::Green),
+        ] {
+            assert_eq!(
+                lines[0]
+                    .spans
+                    .iter()
+                    .find(|span| span.content == text)
+                    .unwrap()
+                    .style
+                    .fg,
+                Some(color)
+            );
+        }
+        assert!(lines[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            lines[2].spans.last().unwrap().style.fg,
+            Some(Color::LightMagenta)
+        );
+        for view in [View::Operations, View::InlineOperations] {
+            app.view = view;
+            app.browse_index = 0;
+            press(&mut app, KeyCode::End);
+            assert_eq!(app.browse_index, 39);
+            let lines = rendered_rows(&mut app, 14);
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("000000000027") && line.contains('▸'))
+            );
+            press(&mut app, KeyCode::Home);
+            let lines = rendered_rows(&mut app, 14);
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("000000000000") && line.contains('▸'))
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_diff_binding_returns_to_both_operation_views_and_rejects_stale_results() {
+        for origin in [View::Operations, View::InlineOperations] {
+            let mut app = key_fixture();
+            app.view = origin;
+            app.listing = operation_fixture(3);
+            app.operation_graph = crate::operations::graph(&app.listing);
+            app.browse_index = 1;
+            assert_eq!(press(&mut app, KeyCode::Char('d')), Effect::None);
+            assert_eq!(app.view, origin);
+            app.listing[1].operation.as_mut().unwrap().snapshot = true;
+            app.keys.merge("[operations]\ndiff=['D']").unwrap();
+            assert_eq!(press(&mut app, KeyCode::Char('d')), Effect::None);
+            assert_eq!(
+                press(&mut app, KeyCode::Char('D')),
+                Effect::Request(crate::live::Request::OperationDiff("000000000001".into()))
+            );
+            assert_eq!(app.view, View::OperationDiff);
+            app.apply_operation_diff("000000000002", Ok("wrong operation".into()));
+            assert!(app.operation_diff.as_ref().unwrap().result.is_none());
+            app.apply_operation_diff(
+                "000000000001",
+                Ok("--- file\n+++ file\n-before\n+after".into()),
+            );
+            let rows = rendered_rows(&mut app, 20);
+            assert!(
+                rows.iter()
+                    .any(|line| line.contains("Snapshot operation diff"))
+            );
+            assert!(rows.iter().any(|line| line.contains("+after")));
+            assert!(matches!(
+                press(&mut app, KeyCode::Esc),
+                Effect::Request(crate::live::Request::Listing(_))
+            ));
+            assert_eq!(app.view, origin);
+            assert_eq!(app.browse_index, 1);
+            app.apply_operation_diff("000000000001", Err("stale error".into()));
+            assert!(app.operation_diff.is_none());
+        }
     }
 
     #[test]

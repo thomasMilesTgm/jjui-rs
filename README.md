@@ -64,7 +64,8 @@ cargo run -- --keybinds ./custom.toml --check-keybinds
 | `c` | Commit the current working copy with an inline description |
 | `B` | Set/move a named bookmark to the cursor revision |
 | `u`, `U` | Undo/redo with confirmation |
-| `o`, `v` | Operation log, evolution history |
+| `o`, `O`, `v` | Inline operations for the focused change, full operation log, evolution history |
+| `d` in operation log | Diff the working-copy changes recorded by a snapshot operation |
 | `r` in operation log | Restore the selected operation, with confirmation |
 | `b` | Repository-wide local and remote bookmarks |
 | `d`, `t`, `u` in bookmarks | Delete local bookmark; track/untrack remote bookmark |

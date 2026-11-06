@@ -79,6 +79,10 @@ impl Repository {
         crate::preview::load(self.repo.as_deref().context("Repository not loaded")?, id).await
     }
 
+    pub async fn operation_diff(&self, id: &str) -> Result<String> {
+        crate::operations::diff(self.repo.as_deref().context("Repository not loaded")?, id).await
+    }
+
     pub async fn set_revset(&mut self, expression: String) -> Result<Snapshot> {
         let previous = std::mem::replace(&mut self.revset, expression);
         match self.refresh(true).await {

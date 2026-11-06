@@ -350,6 +350,125 @@ mod tests {
         run_action(root, "redo", &[], "", &[]);
         run_action(root, "bookmark_delete", &[], "base", &[]);
     }
+
+    #[test]
+    fn related_operations_follow_rewrites_and_refs_but_exclude_other_changes() {
+        fn history(root: &Path, query: crate::browser::Query) -> Vec<crate::browser::Row> {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let mut repo = crate::repository::Repository::open(root, 100).unwrap();
+            runtime.block_on(repo.refresh(true)).unwrap();
+            runtime.block_on(repo.listing(query)).unwrap().rows
+        }
+        let temp = fixture();
+        let root = temp.path();
+        let first = current(root);
+        let sources = [first.change_id.clone()];
+        run_action(root, "describe", &sources, "first", &[]);
+        let describe = history(root, crate::browser::Query::Operations)[0]
+            .id
+            .clone();
+        run_action(root, "set_bookmark", &sources, "topic", &[]);
+        let bookmark = history(root, crate::browser::Query::Operations)[0]
+            .id
+            .clone();
+        run_action(root, "new", &sources, "", &[]);
+        let child = current(root);
+        run_action(root, "describe", &[child.change_id], "unrelated child", &[]);
+        let unrelated = history(root, crate::browser::Query::Operations)[0]
+            .id
+            .clone();
+        let related = history(
+            root,
+            crate::browser::Query::CommitOperations(first.commit_id),
+        );
+        assert!(related.iter().any(|row| row.id == describe));
+        assert!(related.iter().any(|row| row.id == bookmark));
+        assert!(!related.iter().any(|row| row.id == unrelated));
+        assert!(
+            related
+                .iter()
+                .all(|row| !row.operation.as_ref().unwrap().current)
+        );
+        // Removed intervening operations are contracted into real ancestry.
+        let described = related.iter().position(|row| row.id == describe).unwrap();
+        let bookmarked = related.iter().position(|row| row.id == bookmark).unwrap();
+        assert!(bookmarked < described);
+        assert!(
+            related[bookmarked]
+                .operation
+                .as_ref()
+                .unwrap()
+                .parents
+                .contains(&describe)
+        );
+        let after = history(root, crate::browser::Query::Operations);
+        assert_eq!(
+            after[0].id, unrelated,
+            "history reads must not create operations"
+        );
+        assert!(after[0].operation.as_ref().unwrap().current);
+        assert!(after.last().unwrap().operation.as_ref().unwrap().root);
+    }
+
+    #[test]
+    fn snapshot_operation_diff_compares_recorded_workspace_trees() {
+        let temp = fixture();
+        let root = temp.path();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut repo = crate::repository::Repository::open(root, 100).unwrap();
+        std::fs::write(root.join("changed.txt"), "before\n").unwrap();
+        std::fs::write(
+            root.join("unchanged.txt"),
+            "not part of the second snapshot\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("deleted.txt"), "removed\n").unwrap();
+        run_action(root, "snapshot", &[], "", &[]);
+        let before = runtime.block_on(repo.refresh(true)).unwrap().unwrap();
+        std::fs::write(root.join("changed.txt"), "after\n").unwrap();
+        std::fs::remove_file(root.join("deleted.txt")).unwrap();
+        std::fs::write(root.join("added.txt"), "added\n").unwrap();
+        run_action(root, "snapshot", &[], "", &[]);
+        let snapshot = runtime.block_on(repo.refresh(true)).unwrap().unwrap();
+        let listing = runtime
+            .block_on(repo.listing(crate::browser::Query::Operations))
+            .unwrap();
+        assert!(listing.rows[0].operation.as_ref().unwrap().snapshot);
+        // A later snapshot must not change a historical operation's patch.
+        std::fs::write(root.join("changed.txt"), "later\n").unwrap();
+        run_action(root, "snapshot", &[], "", &[]);
+        let latest = runtime.block_on(repo.refresh(true)).unwrap().unwrap();
+        let patch = runtime
+            .block_on(repo.operation_diff(&snapshot.operation))
+            .unwrap();
+        assert!(patch.contains(&format!("Parent {}", before.operation)));
+        assert!(patch.contains("-before\n+after\n"));
+        assert!(patch.contains("+added\n"));
+        assert!(patch.contains("-removed\n"));
+        assert!(!patch.contains("unchanged.txt"));
+        assert!(!patch.contains("later"));
+        assert_eq!(
+            runtime
+                .block_on(repo.refresh(true))
+                .unwrap()
+                .unwrap()
+                .operation,
+            latest.operation
+        );
+        run_action(
+            root,
+            "describe",
+            &[current(root).change_id],
+            "description only",
+            &[],
+        );
+        let described = runtime.block_on(repo.refresh(true)).unwrap().unwrap();
+        assert!(
+            runtime
+                .block_on(repo.operation_diff(&described.operation))
+                .is_err()
+        );
+    }
     #[test]
     fn selected_file_restore_split_and_squash_use_literal_filesets() {
         let temp = fixture();
