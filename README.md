@@ -6,14 +6,29 @@ refresh.
 
 ## Install
 
-Requires Rust 1.97.1+ and `jj` 0.46. After the first crates.io release:
+Requires Rust 1.97.1+ and `jj` 0.47:
 
 ```sh
-cargo install jjui-rs --locked
+cargo install jjui-rs
 jjui-rs -R /path/to/workspace
 ```
 
 From a source checkout, use `cargo install --path . --locked`.
+
+The major/minor version follows `jj-lib`; jjui-rs patch releases are independent.
+
+### Update
+
+```sh
+cargo install jjui-rs --force
+```
+
+- Rebuilds with the latest compatible `jj-lib` patch, even if jjui-rs hasn't had a new release.
+- Add `--locked` to use the dependencies tested with the published release; newer dependency patches
+  then require a new jjui-rs release with an updated lockfile.
+- The header shows the installed `jj` version when it matches, an orange update prompt for patch
+  differences, and a red prompt for major/minor differences. A new major/minor requires a matching
+  jjui-rs release.
 
 ## Why another jj UI?
 

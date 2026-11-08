@@ -117,7 +117,7 @@ pub async fn load(repo: &ReadonlyRepo, id: &str, path: &str) -> Result<Session> 
     let id = CommitId::try_from_hex(id).context("Invalid commit ID")?;
     let commit = repo.store().get_commit_async(&id).await?;
     let path_ref = RepoPath::from_internal_string(path)?;
-    let parent = commit.parent_tree(repo).await?;
+    let parent = commit.parent_tree(repo.index()).await?;
     let before = read_text(repo, path_ref, &parent.path_value(path_ref).await?).await?;
     let after = read_text(repo, path_ref, &commit.tree().path_value(path_ref).await?).await?;
     if let (Some(a), Some(b)) = (&before, &after) {

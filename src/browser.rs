@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use futures::StreamExt;
 #[cfg(test)]
 use jj_lib::object_id::ObjectId;
 use jj_lib::{
@@ -119,7 +120,8 @@ pub async fn load(repo: &ReadonlyRepo, query: Query) -> Result<Listing> {
         Query::Files(id) => {
             let id = CommitId::try_from_hex(id).context("Invalid commit ID")?;
             let commit = repo.store().get_commit_async(&id).await?;
-            for (path, value) in commit.tree().entries() {
+            let mut entries = commit.tree().entries();
+            while let Some((path, value)) = entries.next().await {
                 value?;
                 rows.push(Row {
                     operation: None,

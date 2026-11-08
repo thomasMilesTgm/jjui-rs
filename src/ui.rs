@@ -1,3 +1,4 @@
+mod version;
 mod workspaces;
 use crate::{
     live::{Live, Update},
@@ -18,6 +19,7 @@ use std::{
 
 #[derive(Default)]
 struct App {
+    jj_version: version::Status,
     workspace_menu: Option<workspaces::Menu>,
     full_snapshot: Option<Snapshot>,
     expanded_immutable: HashSet<String>,
@@ -2024,6 +2026,7 @@ pub fn run(
     keybinds_path: Option<std::path::PathBuf>,
     config_source: crate::config::Source,
 ) -> Result<()> {
+    let version_check = version::check();
     let plugin_names = plugin_config.names();
     let plugins = crate::plugins::Worker::start(plugin_config)?;
     let mut terminal = ratatui::init();
@@ -2041,6 +2044,9 @@ pub fn run(
         };
         let mut workspace_check = std::time::Instant::now();
         loop {
+            if let Ok(status) = version_check.try_recv() {
+                app.jj_version = status;
+            }
             if app.workspace_menu.is_some()
                 && !app.pending_command
                 && workspace_check.elapsed() >= Duration::from_secs(2)
@@ -3000,8 +3006,9 @@ fn footer_action_status(app: &App) -> Option<String> {
 }
 
 fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
+    let stale = app.snapshot.as_ref().is_some_and(|s| s.workspace_stale);
     let [header, body, footer] = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(if stale { 2 } else { 1 }),
         Constraint::Min(1),
         Constraint::Length(2),
     ])
@@ -3011,6 +3018,16 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
         .as_ref()
         .map(|s| short(&s.operation))
         .unwrap_or("loading");
+    let version = app.jj_version.line();
+    let [header_main, header_version] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length((version.width() as u16).min(header.width.saturating_sub(10))),
+    ])
+    .areas(header);
+    frame.render_widget(
+        Paragraph::new(version).alignment(ratatui::layout::Alignment::Right),
+        header_version,
+    );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -3026,9 +3043,9 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
                 app.files.len()
             )),
         ])),
-        header,
+        header_main,
     );
-    if app.snapshot.as_ref().is_some_and(|s| s.workspace_stale) {
+    if stale {
         frame.render_widget(
             Paragraph::new(format!(
                 " Working copy STALE · {} update workspace · graph shows repository state",
@@ -3141,18 +3158,8 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
         if !items.is_empty() {
             state.select(Some(app.browse_index.min(items.len() - 1)));
         }
-        let title = match app.view {
-            View::Operations => " Operations (latest 200) ".to_owned(),
-            View::Bookmarks => " Local / remote bookmarks ".to_owned(),
-            _ => format!(
-                " File finder · {} filter · {} open ",
-                app.keys.label("finder", "search"),
-                app.keys.label("finder", "open_file")
-            ),
-        };
         frame.render_stateful_widget(
             List::new(items)
-                .block(Block::bordered().title(title))
                 .highlight_style(Style::default().bg(Color::DarkGray))
                 .highlight_symbol("▸ "),
             body,
@@ -3164,52 +3171,27 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
         app.view,
         View::Diff | View::OperationDiff | View::Help | View::Text | View::Git
     ) {
-        let (title, text) = match app.view {
-            View::Diff => (" Diff ", app.preview_text()),
-            View::OperationDiff => (
-                " Snapshot operation diff ",
-                match app
-                    .operation_diff
-                    .as_ref()
-                    .and_then(|diff| diff.result.as_ref())
-                {
-                    Some(Ok(text)) => text.clone(),
-                    Some(Err(error)) => format!("Cannot load operation diff: {error}"),
-                    None => "Loading operation diff…".into(),
-                },
+        let text = match app.view {
+            View::Diff => app.preview_text(),
+            View::OperationDiff => match app
+                .operation_diff
+                .as_ref()
+                .and_then(|diff| diff.result.as_ref())
+            {
+                Some(Ok(text)) => text.clone(),
+                Some(Err(error)) => format!("Cannot load operation diff: {error}"),
+                None => "Loading operation diff…".into(),
+            },
+            View::Help => format!(
+                "{}\n\nRecent working-tree events\n{}",
+                app.keys.help(),
+                app.files.iter().cloned().collect::<Vec<_>>().join("\n")
             ),
-            View::Help => (
-                " Key bindings ",
-                format!(
-                    "{}\n\nRecent working-tree events\n{}",
-                    app.keys.help(),
-                    app.files.iter().cloned().collect::<Vec<_>>().join("\n")
-                ),
-            ),
-            View::Git => (
-                " Git remotes ",
-                format!(
-                    "{} fetch · {} push · {} add remote · {} remove remote\n\n{}",
-                    app.keys.label("git", "fetch"),
-                    app.keys.label("git", "push"),
-                    app.keys.label("git", "remote_add"),
-                    app.keys.label("git", "remote_remove"),
-                    app.output
-                ),
-            ),
-            _ => (
-                if app.output_is_diff {
-                    " Plugin diff "
-                } else {
-                    " Command output / history "
-                },
-                app.output.clone(),
-            ),
+            _ => app.output.clone(),
         };
         draw_text(
             frame,
             body,
-            title,
             &text,
             &mut app.scroll,
             matches!(app.view, View::Diff | View::OperationDiff)
@@ -3230,18 +3212,7 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
     draw_graph(frame, main, app);
     if let Some(area) = preview_area {
         let text = app.preview_text();
-        draw_text(
-            frame,
-            area,
-            if app.preview_focus {
-                " Diff preview · focused "
-            } else {
-                " Diff preview "
-            },
-            &text,
-            &mut app.scroll,
-            true,
-        );
+        draw_text(frame, area, &text, &mut app.scroll, true);
     }
 }
 
@@ -3529,6 +3500,8 @@ fn operation_duration(millis: i64) -> String {
 }
 
 fn draw_operations(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let block = Block::default();
+    let content = block.inner(area);
     let mut items = Vec::new();
     let mut indices = Vec::new();
     let mut selected = None;
@@ -3544,7 +3517,7 @@ fn draw_operations(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
             for line in prompt_lines(
                 app,
                 &graph.continuation,
-                area.width.saturating_sub(4) as usize,
+                content.width.saturating_sub(2) as usize,
             ) {
                 selected = Some(items.len());
                 indices.push(index);
@@ -3562,7 +3535,7 @@ fn draw_operations(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
     app.operation_selection.select(selected);
     frame.render_stateful_widget(
         List::new(items)
-            .block(Block::bordered().title(" Operations (latest 200) "))
+            .block(block)
             .highlight_style(Style::default().bg(Color::Indexed(236)))
             .highlight_symbol("▸ "),
         area,
@@ -3571,22 +3544,19 @@ fn draw_operations(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
     for (line, index) in indices
         .into_iter()
         .skip(app.operation_selection.offset())
-        .take(area.height.saturating_sub(2) as usize)
+        .take(content.height as usize)
         .enumerate()
     {
         app.operation_hit_rows.push((
-            ratatui::layout::Rect::new(
-                area.x + 1,
-                area.y + 1 + line as u16,
-                area.width.saturating_sub(2),
-                1,
-            ),
+            ratatui::layout::Rect::new(content.x, content.y + line as u16, content.width, 1),
             index,
         ));
     }
 }
 
 fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let block = Block::default();
+    let content = block.inner(area);
     let mut items = Vec::new();
     let mut selected_row = None;
     let mut targets = Vec::new();
@@ -3702,7 +3672,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                 for line in prompt_lines(
                     app,
                     &graph.continuation,
-                    area.width.saturating_sub(4) as usize,
+                    content.width.saturating_sub(2) as usize,
                 ) {
                     prompt_focus = Some(items.len());
                     targets.push((i, None));
@@ -3762,7 +3732,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                         for line in prompt_lines(
                             app,
                             &format!("{}  {}", graph.continuation, op_graph.continuation),
-                            area.width.saturating_sub(4) as usize,
+                            content.width.saturating_sub(2) as usize,
                         ) {
                             prompt_focus = Some(items.len());
                             targets.push((i, None));
@@ -3881,7 +3851,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                             for line in prompt_lines(
                                 app,
                                 &graph.continuation,
-                                area.width.saturating_sub(4) as usize,
+                                content.width.saturating_sub(2) as usize,
                             ) {
                                 prompt_focus = Some(items.len());
                                 targets.push((i, None));
@@ -3912,7 +3882,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
     app.graph_selection.select(selected_row);
     frame.render_stateful_widget(
         List::new(items)
-            .block(Block::bordered().title(format!(" Revisions · /{} ", app.filter)))
+            .block(block)
             .highlight_style(Style::default().bg(Color::Indexed(236)))
             .highlight_symbol("▸ "),
         area,
@@ -3921,51 +3891,36 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
     if let Some((row, column)) = bookmark_cursor {
         let offset = app.graph_selection.offset();
         if row >= offset
-            && row - offset < area.height.saturating_sub(2) as usize
-            && column + 3 < area.width.saturating_sub(1) as usize
+            && row - offset < content.height as usize
+            && column + 2 < content.width as usize
         {
             frame.set_cursor_position((
-                area.x + 3 + column as u16,
-                area.y + 1 + (row - offset) as u16,
+                content.x + 2 + column as u16,
+                content.y + (row - offset) as u16,
             ));
         }
     }
     for (row, (revision, file)) in targets
         .into_iter()
         .skip(app.graph_selection.offset())
-        .take(area.height.saturating_sub(2) as usize)
+        .take(content.height as usize)
         .enumerate()
     {
         if let Some((index, offset)) = chunk_rows.get(&(row + app.graph_selection.offset())) {
             app.chunk_hit_rows.push((
-                ratatui::layout::Rect::new(
-                    area.x + 1,
-                    area.y + 1 + row as u16,
-                    area.width.saturating_sub(2),
-                    1,
-                ),
+                ratatui::layout::Rect::new(content.x, content.y + row as u16, content.width, 1),
                 *index,
                 *offset,
             ));
         }
         if let Some(index) = operation_rows.get(&(row + app.graph_selection.offset())) {
             app.operation_hit_rows.push((
-                ratatui::layout::Rect::new(
-                    area.x + 1,
-                    area.y + 1 + row as u16,
-                    area.width.saturating_sub(2),
-                    1,
-                ),
+                ratatui::layout::Rect::new(content.x, content.y + row as u16, content.width, 1),
                 *index,
             ));
         }
         app.hit_rows.push((
-            ratatui::layout::Rect::new(
-                area.x + 1,
-                area.y + 1 + row as u16,
-                area.width.saturating_sub(2),
-                1,
-            ),
+            ratatui::layout::Rect::new(content.x, content.y + row as u16, content.width, 1),
             revision,
             file,
         ));
@@ -3975,14 +3930,15 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
 fn draw_text(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
-    title: &str,
     text: &str,
     scroll: &mut u16,
     diff: bool,
 ) {
+    let block = Block::default();
+    let content = block.inner(area);
     let count = text.lines().count();
     *scroll = (*scroll as usize)
-        .min(count.saturating_sub(area.height.saturating_sub(2) as usize))
+        .min(count.saturating_sub(content.height as usize))
         .min(u16::MAX as usize) as u16;
     let lines: Vec<_> = text
         .lines()
@@ -4006,9 +3962,7 @@ fn draw_text(
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((*scroll, 0))
-            .block(Block::bordered().title(title)),
+        Paragraph::new(lines).scroll((*scroll, 0)).block(block),
         area,
     );
 }
@@ -4163,6 +4117,31 @@ mod tests {
             working_copy: false,
             ..Revision::default()
         }
+    }
+
+    #[test]
+    fn content_starts_below_header_and_preserves_stale_warning() {
+        let mut app = key_fixture();
+        rendered_rows(&mut app, 40);
+        assert_eq!(app.hit_rows.first().unwrap().0.y, 1);
+        app.snapshot.as_mut().unwrap().workspace_stale = true;
+        let rows = rendered_rows(&mut app, 40);
+        assert!(rows[1].contains("Working copy STALE"));
+        assert_eq!(app.hit_rows.first().unwrap().0.y, 2);
+        app.snapshot.as_mut().unwrap().workspace_stale = false;
+        app.view = View::Text;
+        app.output = "command output".into();
+        assert!(rendered_rows(&mut app, 40)[1].starts_with("command output"));
+    }
+
+    #[test]
+    fn version_indicator_is_at_the_right_of_the_header() {
+        let mut app = key_fixture();
+        app.jj_version = version::Status::Installed(version::library_version().into());
+        let expected = app.jj_version.label().0;
+        let rows = rendered_rows(&mut app, 40);
+        assert!(rows[0].starts_with(" jjui-rs "));
+        assert!(rows[0].ends_with(&expected));
     }
 
     #[test]
@@ -5146,10 +5125,7 @@ mod tests {
                 Ok("--- file\n+++ file\n-before\n+after".into()),
             );
             let rows = rendered_rows(&mut app, 20);
-            assert!(
-                rows.iter()
-                    .any(|line| line.contains("Snapshot operation diff"))
-            );
+            assert!(rows[1].starts_with("--- file"));
             assert!(rows.iter().any(|line| line.contains("+after")));
             assert!(matches!(
                 press(&mut app, KeyCode::Esc),

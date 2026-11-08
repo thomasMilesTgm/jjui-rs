@@ -21,7 +21,7 @@ fn jj(root: &Path, args: &[&str]) {
         .current_dir(root)
         .env("JJ_CONFIG", "")
         .output()
-        .expect("tests require jj 0.46 on PATH");
+        .expect("tests require jj 0.47 on PATH");
     assert!(
         output.status.success(),
         "{}",

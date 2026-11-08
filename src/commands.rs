@@ -124,7 +124,7 @@ pub(crate) fn execute_process(mut process: Command, display: &str) -> Result<Str
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("Could not run jj; install jj 0.46 for editing and Git actions")?;
+        .context("Could not run jj; install jj 0.47 for editing and Git actions")?;
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let out = thread::spawn(move || collect(stdout));

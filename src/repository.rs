@@ -12,7 +12,7 @@ use jj_lib::{
         RevsetWorkspaceContext, SymbolResolver,
     },
     ui_path::RepoPathUiConverter,
-    workspace::Workspace,
+    workspace::{DefaultWorkspaceLoaderFactory, Workspace, WorkspaceLoaderFactory},
 };
 use serde::Serialize;
 
@@ -61,9 +61,8 @@ impl Repository {
             .find(|p| p.join(".jj").is_dir())
             .context("No Jujutsu workspace found; run inside a jj repository")?;
         let settings = crate::settings::load(root)?;
-        let workspace = Workspace::load(
+        let workspace = DefaultWorkspaceLoaderFactory.create(root)?.load(
             &settings,
-            root,
             &default_backend_factories(),
             &default_working_copy_factories(),
         )?;
@@ -157,9 +156,8 @@ impl Repository {
 
     pub fn reload_workspace(&mut self) -> Result<()> {
         let root = self.root();
-        self.workspace = Workspace::load(
+        self.workspace = DefaultWorkspaceLoaderFactory.create(&root)?.load(
             &crate::settings::load(&root)?,
-            &root,
             &default_backend_factories(),
             &default_working_copy_factories(),
         )?;
@@ -253,7 +251,7 @@ impl Repository {
                     .await?,
                 root: id == *repo.store().root_commit_id(),
                 immutable: is_immutable(&id).await?,
-                empty: commit.is_empty(repo.as_ref()).await?,
+                empty: commit.is_empty(repo.index()).await?,
                 conflict: commit.has_conflict(),
                 bookmarks,
                 tags: repo
@@ -327,7 +325,7 @@ pub fn evaluate_revset(
         aliases_map: &aliases,
         local_variables: Default::default(),
         user_email: settings.user_email(),
-        date_pattern_context: chrono::Local::now().into(),
+        current_time: jiff::Zoned::now(),
         default_ignored_remote: Some(jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO),
         fileset_aliases_map: &fileset_aliases,
         extensions: &extensions,

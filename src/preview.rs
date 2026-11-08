@@ -55,7 +55,7 @@ impl Preview {
 pub async fn load(repo: &ReadonlyRepo, id: &str) -> Result<Preview> {
     let id = CommitId::try_from_hex(id).context("Invalid commit ID")?;
     let commit = repo.store().get_commit_async(&id).await?;
-    let before = commit.parent_tree(repo).await?;
+    let before = commit.parent_tree(repo.index()).await?;
     let after = commit.tree();
     diff_trees(repo, &before, &after, id.hex()).await
 }
@@ -76,7 +76,7 @@ async fn diff_trees(
     after: &MergedTree,
     id: String,
 ) -> Result<Preview> {
-    let mut entries = before.diff_stream(after, &EverythingMatcher);
+    let mut entries = before.diff(after, &EverythingMatcher);
     let mut preview = Preview {
         commit_id: id,
         files: Vec::new(),
