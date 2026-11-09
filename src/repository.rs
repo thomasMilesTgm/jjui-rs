@@ -29,9 +29,14 @@ pub struct Revision {
     pub commit_prefix_len: usize,
     pub root: bool,
     pub immutable: bool,
+    /// Keep the context selected by the default log visible, even if immutable.
+    pub log_context: bool,
+    pub outside_revset: bool,
     pub empty: bool,
     pub conflict: bool,
     pub bookmarks: Vec<String>,
+    /// Untracked remote labels outside the normal log don't pin immutable rows.
+    pub elide_bookmarks: bool,
     pub tags: Vec<String>,
     pub working_copy: bool,
     pub workspaces: Vec<String>,
@@ -42,6 +47,7 @@ pub struct Snapshot {
     pub workspace_stale: bool,
     pub operation: String,
     pub revisions: Vec<Revision>,
+    pub ancestors: Vec<Revision>,
 }
 
 pub struct Repository {
@@ -61,6 +67,7 @@ impl Repository {
             .find(|p| p.join(".jj").is_dir())
             .context("No Jujutsu workspace found; run inside a jj repository")?;
         let settings = crate::settings::load(root)?;
+        let revset = settings.get_string("revsets.log")?;
         let workspace = DefaultWorkspaceLoaderFactory.create(root)?.load(
             &settings,
             &default_backend_factories(),
@@ -72,12 +79,16 @@ impl Repository {
             operation: None,
             workspace_stale: false,
             repo: None,
-            revset: "all()".into(),
+            revset,
         })
     }
 
     pub fn workspace_stale(&self) -> bool {
         self.workspace_stale
+    }
+
+    pub fn revset(&self) -> &str {
+        &self.revset
     }
 
     pub async fn snapshot(&mut self) -> Result<()> {
@@ -220,13 +231,43 @@ impl Repository {
             "immutable()",
         )?;
         let is_immutable = immutable.containing_fn();
+        let default_log = self.workspace.settings().get_string("revsets.log")?;
+        let log_context = self.revset.trim() == default_log.trim();
+        let log = evaluate_revset(
+            repo.as_ref(),
+            self.workspace.settings(),
+            &self.root(),
+            self.workspace.workspace_name(),
+            "builtin_log()",
+        )?;
+        let in_log = log.containing_fn();
+        let ancestors = evaluate_revset(
+            repo.as_ref(),
+            self.workspace.settings(),
+            &self.root(),
+            self.workspace.workspace_name(),
+            &format!("ancestors(({})) ~ ({})", self.revset, self.revset),
+        )?;
         let mut revisions = Vec::new();
-        let mut stream = revset.stream().take(self.limit);
-        while let Some(id) = stream.next().await {
+        let mut ancestor_revisions = Vec::new();
+        let mut stream = revset
+            .stream()
+            .take(self.limit)
+            .map(|id| (id, false))
+            .chain(ancestors.stream().take(self.limit).map(|id| (id, true)));
+        while let Some((id, outside_revset)) = stream.next().await {
             let id = id?;
             let commit = repo.store().get_commit_async(&id).await?;
             let bookmarks = bookmark_labels(repo.view(), &id);
-            revisions.push(Revision {
+            let elide_bookmarks = !bookmarks.is_empty()
+                && repo.view().local_bookmarks_for_commit(&id).next().is_none()
+                && !repo.view().all_remote_bookmarks().any(|(symbol, remote)| {
+                    symbol.remote.as_str() != "git"
+                        && remote.is_tracked()
+                        && remote.target.present_adds().any(|target| target == &id)
+                })
+                && !in_log(&id).await?;
+            let revision = Revision {
                 commit_id: id.hex(),
                 change_id: commit.change_id().reverse_hex(),
                 parents: commit.parent_ids().iter().map(ObjectId::hex).collect(),
@@ -251,9 +292,12 @@ impl Repository {
                     .await?,
                 root: id == *repo.store().root_commit_id(),
                 immutable: is_immutable(&id).await?,
+                log_context: log_context && !outside_revset,
+                outside_revset,
                 empty: commit.is_empty(repo.index()).await?,
                 conflict: commit.has_conflict(),
                 bookmarks,
+                elide_bookmarks,
                 tags: repo
                     .view()
                     .local_tags()
@@ -271,7 +315,12 @@ impl Repository {
                 } else {
                     Vec::new()
                 },
-            });
+            };
+            if outside_revset {
+                ancestor_revisions.push(revision);
+            } else {
+                revisions.push(revision);
+            }
         }
         self.repo = Some(repo.clone());
         self.operation = Some(operation.clone());
@@ -279,6 +328,7 @@ impl Repository {
             workspace_stale,
             operation,
             revisions,
+            ancestors: ancestor_revisions,
         }))
     }
 }
@@ -294,15 +344,26 @@ pub fn evaluate_revset(
     for (name, body) in [
         (
             "trunk()",
-            "latest(remote_bookmarks(exact:\"main\") | remote_bookmarks(exact:\"master\"))",
+            r#"latest(
+                remote_bookmarks(exact:"main", exact:"origin") |
+                remote_bookmarks(exact:"master", exact:"origin") |
+                remote_bookmarks(exact:"trunk", exact:"origin") |
+                remote_bookmarks(exact:"main", exact:"upstream") |
+                remote_bookmarks(exact:"master", exact:"upstream") |
+                remote_bookmarks(exact:"trunk", exact:"upstream") | root()
+            )"#,
         ),
         (
             "builtin_immutable_heads()",
-            "trunk() | tags() | remote_bookmarks() | root()",
+            "trunk() | tags() | untracked_remote_bookmarks() | untracked_remote_tags()",
         ),
         ("immutable_heads()", "builtin_immutable_heads()"),
-        ("immutable()", "::immutable_heads()"),
+        ("immutable()", "::(immutable_heads() | root())"),
         ("mutable()", "~immutable()"),
+        (
+            "builtin_log()",
+            "present(@) | ancestors(immutable_heads().., 2) | trunk()",
+        ),
     ] {
         aliases.insert(name, body.to_owned(), None)?;
     }

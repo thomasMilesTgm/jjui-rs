@@ -359,6 +359,30 @@ fn native_revsets_load_repository_aliases_without_jj() {
 }
 
 #[test]
+fn default_log_respects_configuration_and_explicit_revision_override() {
+    let temp = fixture();
+    jj(temp.path(), &["new", "-m", "current work"]);
+    std::fs::write(
+        temp.path().join(".jj/repo/config.toml"),
+        "[revsets]\nlog = 'parents(@)'\n",
+    )
+    .unwrap();
+    let default = snapshot(temp.path());
+    let rows = default["revisions"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["description"], "first revision\n");
+    assert_eq!(rows[0]["log_context"], true);
+    let output = viewer(temp.path())
+        .args(["--once", "-r", "@"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let explicit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(explicit["revisions"].as_array().unwrap().len(), 1);
+    assert_eq!(explicit["revisions"][0]["working_copy"], true);
+}
+
+#[test]
 fn opt_in_native_snapshot_records_edits_without_jj() {
     let temp = fixture();
     let before = heads(temp.path());
@@ -687,4 +711,149 @@ fn tags_appear_and_disappear_in_native_live_snapshots() {
                 .iter()
                 .all(|r| r["tags"].as_array().unwrap().is_empty())
     });
+}
+
+#[test]
+fn native_log_alias_matches_jj_with_old_untracked_remote_bookmarks() {
+    let temp = fixture();
+    jj(temp.path(), &["bookmark", "create", "old-topic"]);
+    jj(temp.path(), &["new", "-m", "intermediate history"]);
+    jj(temp.path(), &["new", "-m", "trunk base"]);
+    jj(temp.path(), &["bookmark", "create", "main"]);
+    jj(temp.path(), &["new", "-m", "current work"]);
+    for name in ["old-topic", "main"] {
+        let status = Command::new("git")
+            .args([
+                "update-ref",
+                &format!("refs/remotes/origin/{name}"),
+                &format!("refs/heads/{name}"),
+            ])
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    jj(temp.path(), &["git", "import"]);
+    jj(temp.path(), &["bookmark", "forget", "old-topic"]);
+    let expected = Command::new("jj")
+        .args([
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "builtin_log()",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ])
+        .current_dir(temp.path())
+        .env("JJ_CONFIG", "")
+        .output()
+        .unwrap();
+    assert!(
+        expected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    let before = heads(temp.path());
+    let output = viewer(temp.path())
+        .env("JJ_CONFIG", "")
+        .args(["--once"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let selected: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let revisions = selected["revisions"].as_array().unwrap();
+    assert!(selected["ancestors"].as_array().unwrap().iter().any(|r| {
+        r["outside_revset"] == true
+            && r["bookmarks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b == "old-topic@origin")
+    }));
+    let actual: std::collections::BTreeSet<_> = revisions
+        .iter()
+        .map(|revision| revision["commit_id"].as_str().unwrap().to_owned())
+        .collect();
+    let expected: std::collections::BTreeSet<_> = String::from_utf8(expected.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(actual, expected);
+    let all_history = || {
+        let output = viewer(temp.path())
+            .args(["--once", "-r", "all()"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let all = all_history();
+    let old = all["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| {
+            r["bookmarks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b == "old-topic@origin")
+        })
+        .expect("older remote history remains available for expansion");
+    assert_eq!(old["elide_bookmarks"], true);
+    let trunk = all["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["description"] == "trunk base\n")
+        .unwrap();
+    assert_eq!(trunk["elide_bookmarks"], false);
+    assert!(!revisions.iter().any(|revision| {
+        revision["bookmarks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|bookmark| bookmark == "old-topic@origin")
+    }));
+    assert!(
+        revisions
+            .iter()
+            .any(|revision| revision["description"] == "trunk base\n")
+    );
+    assert_eq!(heads(temp.path()), before);
+
+    // A local bookmark still pins the same older commit, regardless of age.
+    jj(
+        temp.path(),
+        &["bookmark", "create", "keep-old", "-r", "old-topic@origin"],
+    );
+    let local = all_history();
+    assert_eq!(
+        local["revisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["commit_id"] == old["commit_id"])
+            .unwrap()["elide_bookmarks"],
+        false
+    );
+    jj(temp.path(), &["bookmark", "forget", "keep-old"]);
+    // Tracking the remote likewise makes its target significant to the user.
+    jj(temp.path(), &["bookmark", "track", "old-topic@origin"]);
+    let tracked = all_history();
+    assert_eq!(
+        tracked["revisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["commit_id"] == old["commit_id"])
+            .unwrap()["elide_bookmarks"],
+        false
+    );
 }

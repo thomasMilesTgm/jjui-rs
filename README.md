@@ -52,7 +52,8 @@ explicit recovery. Editing and Git commands still use the `jj` CLI.
 
 ## Features
 
-- Expandable immutable-history rows in the live graph.
+- The graph follows Jujutsu's `revsets.log`. Its ancestor boundary opens bookmark-level history,
+  with immutable stretches expandable separately. Use `-r 'all()'` for full history.
 - Inline files, diffs, operation history, and action prompts.
 - Bookmark and Git menus, with local/remote divergence markers.
 - Workspace switching, creation, renaming, forgetting, removal, and stale-workspace recovery. Live

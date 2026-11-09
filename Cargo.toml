@@ -1,6 +1,6 @@
 [package]
 name = "jjui-rs"
-version = "0.47.0"
+version = "0.47.1"
 edition = "2024"
 rust-version = "1.97.1"
 description = "A live terminal UI for Jujutsu with native repository access"

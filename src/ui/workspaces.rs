@@ -165,7 +165,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     frame.render_widget(block, popup);
     let parts = Layout::vertical([
         Constraint::Min(0),
-        Constraint::Length(if app.input.is_some() { 3 } else { 0 }),
+        Constraint::Length(if app.input.is_some() { 2 } else { 0 }),
     ])
     .split(inner);
     let items: Vec<_> = menu
@@ -224,14 +224,12 @@ pub(super) fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     );
     if let Some(input) = &app.input {
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled(input.label.clone(), Style::default().fg(Color::Yellow)),
-                Line::raw(if input.confirm {
-                    "Enter confirms · Esc cancels".into()
-                } else {
-                    input.visible()
-                }),
-            ])
+            Paragraph::new(if input.confirm {
+                input.label.clone()
+            } else {
+                input.visible()
+            })
+            .style(Style::default().fg(Color::Yellow))
             .wrap(ratatui::widgets::Wrap { trim: false }),
             parts[1],
         );

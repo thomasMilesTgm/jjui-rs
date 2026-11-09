@@ -64,9 +64,9 @@ struct Args {
     /// Validate bindings and print effective action bindings
     #[arg(long)]
     check_keybinds: bool,
-    /// Revision expression evaluated directly through jj-lib
-    #[arg(short = 'r', long, default_value = "all()")]
-    revisions: String,
+    /// Revision expression (defaults to Jujutsu's revsets.log)
+    #[arg(short = 'r', long)]
+    revisions: Option<String>,
     /// Keep snapshotting edits through jj-lib after the TUI opening snapshot
     #[arg(long, conflicts_with = "no_auto_snapshot")]
     auto_snapshot: bool,
@@ -158,13 +158,14 @@ fn main() -> Result<()> {
     }
     if args.once {
         let mut repo = repository::Repository::open(&args.repository, args.limit as usize)?;
+        let revisions = args.revisions.unwrap_or_else(|| repo.revset().to_owned());
         let runtime = tokio::runtime::Runtime::new()?;
         if config.auto_snapshot {
             runtime.block_on(repo.snapshot())?;
         }
         println!(
             "{}",
-            serde_json::to_string(&runtime.block_on(repo.set_revset(args.revisions.clone()))?)?
+            serde_json::to_string(&runtime.block_on(repo.set_revset(revisions))?)?
         );
         return Ok(());
     }

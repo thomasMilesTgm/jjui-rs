@@ -73,7 +73,7 @@ pub fn start(
     path: PathBuf,
     limit: usize,
     auto_snapshot: bool,
-    initial_revset: String,
+    initial_revset: Option<String>,
     snapshot_on_open: bool,
 ) -> Result<Live> {
     let (tasks, task_requests) = mpsc::sync_channel(8);
@@ -82,6 +82,7 @@ pub fn start(
     let (refresh, requests) = mpsc::sync_channel(1);
     // Initialize before entering raw mode, so startup errors are readable.
     let mut repo = Repository::open(&path, limit)?;
+    let initial_revset = initial_revset.unwrap_or_else(|| repo.revset().to_owned());
     let runtime = tokio::runtime::Runtime::new()?;
     let mut first = runtime.block_on(repo.set_revset(initial_revset.clone()))?;
     if (snapshot_on_open || auto_snapshot) && !first.workspace_stale {

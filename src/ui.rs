@@ -23,6 +23,7 @@ struct App {
     workspace_menu: Option<workspaces::Menu>,
     full_snapshot: Option<Snapshot>,
     expanded_immutable: HashSet<String>,
+    ancestors_expanded: bool,
     hidden_immutable: std::collections::HashMap<String, Vec<String>>,
     keys: crate::keybinds::Keybinds,
     repository_path: String,
@@ -139,7 +140,16 @@ impl App {
     }
     fn expand_immutable(&mut self) {
         if let Some(ids) = self.selected_elision().cloned() {
-            self.expanded_immutable = ids.into_iter().collect();
+            let ancestor_row = self
+                .snapshot
+                .as_ref()
+                .and_then(|s| self.selection.selected().and_then(|i| s.revisions.get(i)))
+                .is_some_and(|r| r.outside_revset);
+            if ancestor_row {
+                self.ancestors_expanded = true;
+            } else {
+                self.expanded_immutable = ids.into_iter().collect();
+            }
             if let Some(snapshot) = self.full_snapshot.clone() {
                 self.update(snapshot);
             }
@@ -148,7 +158,7 @@ impl App {
         }
     }
     fn collapse_immutable(&mut self) {
-        if self.expanded_immutable.is_empty() {
+        if self.expanded_immutable.is_empty() && !self.ancestors_expanded {
             return;
         }
         let focused = self
@@ -160,7 +170,11 @@ impl App {
                     .and_then(|index| snapshot.revisions.get(index))
             })
             .map(|r| r.commit_id.clone());
-        self.expanded_immutable.clear();
+        if self.expanded_immutable.is_empty() {
+            self.ancestors_expanded = false;
+        } else {
+            self.expanded_immutable.clear();
+        }
         if let Some(snapshot) = self.full_snapshot.clone() {
             self.update(snapshot);
         }
@@ -182,6 +196,21 @@ impl App {
         self.notice = None;
     }
     fn collapse_unfocused_immutable(&mut self) {
+        let focused = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| self.selection.selected().and_then(|i| s.revisions.get(i)));
+        if self.ancestors_expanded
+            && !focused.is_some_and(|r| {
+                self.full_snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.ancestors.iter().any(|a| a.commit_id == r.commit_id))
+            })
+        {
+            self.expanded_immutable.clear();
+            self.collapse_immutable();
+            return;
+        }
         if !self.expanded_immutable.is_empty()
             && !self
                 .selected_id()
@@ -528,7 +557,7 @@ impl App {
         self.key_sequence.push(key);
         let action = match self.keys.resolve_sequence(scope, &self.key_sequence) {
             crate::keybinds::BindingMatch::Prefix => {
-                self.notice = Some("Key sequence… (Esc cancels)".into());
+                self.notice = Some("Key sequence…".into());
                 return None;
             }
             crate::keybinds::BindingMatch::Action(action) => action,
@@ -554,7 +583,7 @@ impl App {
             && self.workspace_menu.is_none()
             && self.plugin_choice.is_none()
             && self.key_sequence.is_empty()
-            && !self.expanded_immutable.is_empty()
+            && (!self.expanded_immutable.is_empty() || self.ancestors_expanded)
             && self.keys.resolve("revisions", key).as_deref() == Some("cancel")
         {
             self.collapse_immutable();
@@ -1293,11 +1322,7 @@ impl App {
             "rebase" | "squash" => {
                 self.target = Some((action.clone(), self.sources(), self.selected_files()));
                 self.view = View::Revisions;
-                self.notice = Some(format!(
-                    "{action}: choose destination, {} apply, {} cancel",
-                    self.keys.label("input", "submit"),
-                    self.keys.label("global", "cancel")
-                ));
+                self.notice = None;
                 return Effect::None;
             }
             "undo" => {
@@ -1951,11 +1976,48 @@ impl App {
 
     fn update(&mut self, snapshot: Snapshot) {
         self.full_snapshot = Some(snapshot.clone());
+        let mut history = if self.ancestors_expanded {
+            crate::elision::with_ancestors(&snapshot.revisions, &snapshot.ancestors)
+        } else {
+            snapshot.revisions.clone()
+        };
+        if self.ancestors_expanded {
+            for revision in &mut history {
+                if revision.outside_revset {
+                    revision.outside_revset = false;
+                    revision.elide_bookmarks = false;
+                }
+            }
+        }
         self.expanded_immutable
-            .retain(|id| snapshot.revisions.iter().any(|r| &r.commit_id == id));
-        let (revisions, hidden) =
-            crate::elision::collapse(&snapshot.revisions, &self.expanded_immutable, &self.marked);
+            .retain(|id| history.iter().any(|r| &r.commit_id == id));
+        let (mut revisions, mut hidden) =
+            crate::elision::collapse(&history, &self.expanded_immutable, &self.marked);
+        let mut graph = crate::graph::render(&revisions);
+        if !self.ancestors_expanded
+            && let Some(ancestor) = snapshot.ancestors.first()
+            && let Some(boundary) = graph.last_mut().and_then(|row| row.boundary.take())
+        {
+            // Make the existing log boundary selectable without introducing
+            // any ancestor nodes or edges into the collapsed graph.
+            let mut placeholder = ancestor.clone();
+            placeholder.parents.clear();
+            hidden.insert(
+                placeholder.commit_id.clone(),
+                snapshot
+                    .ancestors
+                    .iter()
+                    .map(|r| r.commit_id.clone())
+                    .collect(),
+            );
+            revisions.push(placeholder);
+            graph.push(crate::graph::GraphRow {
+                node: boundary,
+                ..Default::default()
+            });
+        }
         let snapshot = Snapshot {
+            ancestors: Vec::new(),
             workspace_stale: snapshot.workspace_stale,
             operation: snapshot.operation,
             revisions,
@@ -1968,7 +2030,7 @@ impl App {
             .and_then(|i| visible.get(i))
             .and_then(|i| self.snapshot.as_ref().map(|s| &s.revisions[*i]))
             .map(|r| (r.commit_id.clone(), r.change_id.clone()));
-        self.graph = crate::graph::render(&snapshot.revisions);
+        self.graph = graph;
         self.marked
             .retain(|id| snapshot.revisions.iter().any(|r| &r.commit_id == id));
         self.snapshot = Some(snapshot);
@@ -2305,7 +2367,7 @@ pub fn run(
                             path,
                             live.limit,
                             auto_snapshot,
-                            app.revset.clone(),
+                            Some(app.revset.clone()),
                             true,
                         )?;
                         Ok((next, keys, theme))
@@ -2417,8 +2479,9 @@ fn prompt_lines(app: &App, prefix: &str, width: usize) -> Vec<Line<'static>> {
     ) {
         return Vec::new();
     }
-    let mut text = vec![input.label.clone()];
+    let mut text = Vec::new();
     if input.confirm {
+        text.push(input.label.clone());
         if !input.text.is_empty() {
             text.push(input.text.clone());
         }
@@ -2428,12 +2491,13 @@ fn prompt_lines(app: &App, prefix: &str, width: usize) -> Vec<Line<'static>> {
     } else {
         text.push(input.visible());
     }
-    text.push(format!(
-        "{} apply · {} cancel",
-        app.keys.label("input", "submit"),
-        app.keys.label("input", "cancel")
-    ));
-    let available = width.saturating_sub(Line::raw(prefix).width() + 2).max(1);
+    let prefix = format!(
+        "{prefix}{}",
+        if input.action == "describe" { "" } else { "  " }
+    );
+    let available = width
+        .saturating_sub(Line::raw(prefix.clone()).width())
+        .max(1);
     let mut result = Vec::new();
     for text in text {
         let mut line = String::new();
@@ -2442,7 +2506,7 @@ fn prompt_lines(app: &App, prefix: &str, width: usize) -> Vec<Line<'static>> {
             let size = Span::raw(c.to_string()).width();
             if c == '\n' || used + size > available {
                 result.push(Line::from(vec![
-                    Span::styled(format!("{prefix}  "), Style::default().fg(Color::Green)),
+                    Span::styled(prefix.clone(), Style::default().fg(Color::Green)),
                     Span::styled(
                         std::mem::take(&mut line),
                         Style::default().fg(Color::Yellow),
@@ -2500,25 +2564,24 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         );
         frame.render_widget(ratatui::widgets::Clear, area);
         let text = if input.confirm {
-            format!(
-                "{}\nSources: {}\nFiles: {}",
-                input.text,
-                input.sources.join(", "),
-                input.files.join(", ")
-            )
+            let mut lines = vec![input.label.clone()];
+            if !input.text.is_empty() {
+                lines.push(input.text.clone());
+            }
+            if !input.sources.is_empty() {
+                lines.push(format!("Sources: {}", input.sources.join(", ")));
+            }
+            if !input.files.is_empty() {
+                lines.push(format!("Files: {}", input.files.join(", ")));
+            }
+            lines.join("\n")
         } else {
             input.visible()
         };
-        let text = format!(
-            "{text}\n{} apply · {} cancel · {} newline",
-            app.keys.label("input", "submit"),
-            app.keys.label("input", "cancel"),
-            app.keys.label("input", "newline")
-        );
         frame.render_widget(
             Paragraph::new(text)
                 .wrap(ratatui::widgets::Wrap { trim: false })
-                .block(Block::bordered().title(input.label.clone())),
+                .block(Block::bordered()),
             area,
         );
     }
@@ -2566,6 +2629,21 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             ),
         );
     }
+    if app.workspace_menu.is_some()
+        && let Some(input) = &app.input
+        && !input.confirm
+    {
+        let area = frame.area();
+        frame.render_widget(
+            Paragraph::new(input.label.clone()).style(Style::default().fg(Color::Yellow)),
+            ratatui::layout::Rect::new(
+                area.x,
+                area.bottom().saturating_sub(1),
+                area.width,
+                area.height.min(1),
+            ),
+        );
+    }
     if app
         .input
         .as_ref()
@@ -2573,7 +2651,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     {
         let area = frame.area();
         let width = area.width.saturating_sub(4).min(68);
-        let height = area.height.saturating_sub(4).min(7);
+        let height = area.height.saturating_sub(4).min(4);
         let popup = ratatui::layout::Rect::new(
             area.x + (area.width - width) / 2,
             area.y + (area.height - height) / 2,
@@ -2582,24 +2660,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         );
         frame.render_widget(ratatui::widgets::Clear, popup);
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::raw("Undo the last operation in this repository?"),
-                Line::raw("This applies to repository history, not just the selected commit."),
-                Line::raw(""),
-                render_footer_hints(
-                    app,
-                    width.saturating_sub(2) as usize,
-                    [("submit", "undo"), ("cancel", "cancel")]
-                        .into_iter()
-                        .filter_map(|(action, label)| {
-                            app.keys
-                                .hint("input", action)
-                                .map(|key| (key, label.into()))
-                        }),
-                ),
-            ])
-            .wrap(ratatui::widgets::Wrap { trim: false })
-            .block(Block::bordered().title(" Confirm undo ")),
+            Paragraph::new("Undo the last operation in this repository?")
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(Block::bordered().title(" Confirm undo ")),
             popup,
         );
     }
@@ -2754,9 +2817,17 @@ fn footer_hints(app: &App, width: usize) -> Line<'static> {
     if app.view == View::Revisions
         && app.input.is_none()
         && app.target.is_none()
-        && !app.expanded_immutable.is_empty()
+        && (!app.expanded_immutable.is_empty() || app.ancestors_expanded)
     {
-        hints.push(("revisions", "cancel", "hide immutable commits"));
+        hints.push((
+            "revisions",
+            "cancel",
+            if app.expanded_immutable.is_empty() {
+                "hide ancestors"
+            } else {
+                "hide immutable commits"
+            },
+        ));
     }
     if let Some(input) = &app.input {
         hints.extend([
@@ -2781,8 +2852,21 @@ fn footer_hints(app: &App, width: usize) -> Line<'static> {
             ]);
         }
     } else if scope == "elision" {
+        let ancestor_boundary = app
+            .snapshot
+            .as_ref()
+            .and_then(|s| app.selection.selected().and_then(|i| s.revisions.get(i)))
+            .is_some_and(|r| r.outside_revset);
         hints.extend([
-            ("elision", "expand", "show hidden commits"),
+            (
+                "elision",
+                "expand",
+                if ancestor_boundary {
+                    "show remote ancestry"
+                } else {
+                    "show hidden commits"
+                },
+            ),
             ("elision", "down", "down"),
             ("elision", "up", "up"),
             ("elision", "working_copy", "working copy"),
@@ -2981,9 +3065,18 @@ fn footer_action_status(app: &App) -> Option<String> {
                 .join(", ")
         ));
     }
-    if let Some((action, sources, _)) = &app.target
-        && action == "rebase"
+    if let Some(input) = &app.input
+        && !input.confirm
+        && !matches!(input.action.as_str(), "command" | "set_bookmark")
     {
+        return Some(input.label.clone());
+    }
+    if let Some((action, sources, _)) = &app.target {
+        let label = if action == "rebase" {
+            "Rebase"
+        } else {
+            "Squash"
+        };
         let destination = if app.selected_elision().is_some() {
             "hidden commits (expand to choose)".into()
         } else {
@@ -2998,7 +3091,7 @@ fn footer_action_status(app: &App) -> Option<String> {
                 .unwrap_or_else(|| "no destination".into())
         };
         return Some(format!(
-            "Rebase {} revision(s) → {destination} · choose destination",
+            "{label} {} revision(s) → {destination}",
             sources.len()
         ));
     }
@@ -3236,6 +3329,14 @@ fn log_id_width(id: &str, prefix_len: usize, color: Color, width: usize) -> Vec<
     ]
 }
 
+fn revision_graph_style(revision: &crate::repository::Revision) -> Style {
+    Style::default().fg(if revision.immutable {
+        Color::DarkGray
+    } else {
+        Color::Green
+    })
+}
+
 fn revision_header(
     revision: &crate::repository::Revision,
     node: &str,
@@ -3245,7 +3346,7 @@ fn revision_header(
     let wc = revision.working_copy;
     let mut spans = vec![Span::styled(
         node.to_owned(),
-        Style::default().fg(Color::Green),
+        revision_graph_style(revision),
     )];
     spans.extend(log_id(
         &revision.change_id,
@@ -3352,7 +3453,7 @@ fn revision_description(revision: &crate::repository::Revision, edge: &str) -> L
     };
     let mut spans = vec![Span::styled(
         edge.to_owned(),
-        Style::default().fg(Color::Green),
+        revision_graph_style(revision),
     )];
     if revision.empty {
         spans.push(Span::styled("(empty) ", Style::default().fg(green)));
@@ -3579,19 +3680,23 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                 targets.push((i, None));
                 items.push(ListItem::new(Line::from(vec![
                     Span::styled(
-                        graph.node.replace('○', "~"),
-                        Style::default().fg(Color::Green),
+                        graph.node.replace(['○', '@'], "~"),
+                        revision_graph_style(revision),
                     ),
                     Span::styled(
-                        format!(
-                            "{} immutable revision{}",
-                            hidden.len(),
-                            if hidden.len() == 1 { "" } else { "s" }
-                        ),
+                        if revision.outside_revset {
+                            String::new()
+                        } else {
+                            format!(
+                                "{} immutable revision{}",
+                                hidden.len(),
+                                if hidden.len() == 1 { "" } else { "s" }
+                            )
+                        },
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled(
-                        if revision.bookmarks.is_empty() {
+                        if revision.outside_revset || revision.bookmarks.is_empty() {
                             String::new()
                         } else {
                             format!("  {}", revision.bookmarks.join(" "))
@@ -3603,7 +3708,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                     targets.push((i, None));
                     items.push(ListItem::new(Line::styled(
                         graph.edge.clone(),
-                        Style::default().fg(Color::Green),
+                        revision_graph_style(revision),
                     )));
                 }
                 if let Some(boundary) = &graph.boundary {
@@ -3658,12 +3763,25 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                 ));
             }
             items.push(ListItem::new(header).style(style));
-            if !revision.root {
+            let describing = selected
+                && app
+                    .input
+                    .as_ref()
+                    .is_some_and(|input| input.action == "describe");
+            let mut prompt_focus = None;
+            if describing {
+                for line in prompt_lines(app, &graph.edge, content.width.saturating_sub(2) as usize)
+                {
+                    prompt_focus = Some(items.len());
+                    targets.push((i, None));
+                    items.push(ListItem::new(line));
+                }
+            } else if !revision.root {
                 targets.push((i, None));
                 items.push(ListItem::new(revision_description(revision, &graph.edge)).style(style));
             }
-            let mut prompt_focus = None;
             if selected
+                && !describing
                 && app.input.is_some()
                 && app.view != View::Chunks
                 && app.view != View::Bookmarks
@@ -3678,23 +3796,6 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                     targets.push((i, None));
                     items.push(ListItem::new(line));
                 }
-            }
-            if selected
-                && let Some((action, sources, _)) = &app.target
-                && action != "rebase"
-            {
-                targets.push((i, None));
-                items.push(ListItem::new(format!(
-                    "{}  {action}: {} → {} · {} apply · Esc cancel",
-                    graph.continuation,
-                    sources
-                        .iter()
-                        .map(|s| &s[..s.len().min(8)])
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    &revision.change_id[..revision.change_id.len().min(8)],
-                    app.keys.label("input", "submit")
-                )));
             }
             if selected && app.view == View::InlineOperations {
                 targets.push((i, None));
@@ -3722,8 +3823,12 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                     if index == app.browse_index {
                         selected_row = Some(items.len());
                     }
-                    for line in operation_lines(row, op_graph, &format!("{}  ", graph.continuation))
+                    for mut line in
+                        operation_lines(row, op_graph, &format!("{}  ", graph.continuation))
                     {
+                        if let Some(outer) = line.spans.first_mut() {
+                            outer.style = revision_graph_style(revision);
+                        }
                         operation_rows.insert(items.len(), index);
                         targets.push((i, None));
                         items.push(ListItem::new(line));
@@ -3744,10 +3849,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
             if selected && app.view == View::Files {
                 let inline = |text: String| {
                     ListItem::new(Line::from(vec![
-                        Span::styled(
-                            graph.continuation.clone(),
-                            Style::default().fg(Color::Green),
-                        ),
+                        Span::styled(graph.continuation.clone(), revision_graph_style(revision)),
                         Span::raw(format!("  {text}")),
                     ]))
                 };
@@ -3842,7 +3944,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                                             "   "
                                         }
                                     ),
-                                    Style::default().fg(Color::Green),
+                                    revision_graph_style(revision),
                                 ),
                                 Span::styled(text.to_owned(), Style::default().fg(color)),
                             ])));
@@ -4027,7 +4129,7 @@ fn draw_bookmarks(frame: &mut ratatui::Frame, body: ratatui::layout::Rect, app: 
     let filter = if let Some(input) = &app.input
         && input.action != "command"
     {
-        format!("{}: {}", input.label, input.visible())
+        input.visible()
     } else {
         format!(
             "Showing: {}{}",
@@ -4145,6 +4247,54 @@ mod tests {
     }
 
     #[test]
+    fn description_editing_reuses_its_row_and_puts_context_only_in_footer() {
+        let mut app = key_fixture();
+        rendered_rows(&mut app, 40);
+        let positions = app.hit_rows.clone();
+        press(&mut app, KeyCode::Char('i'));
+        let input = app.input.as_mut().unwrap();
+        input.text = "edited description".into();
+        input.cursor = input.text.len();
+        let rows = rendered_rows(&mut app, 40);
+        assert_eq!(app.hit_rows, positions);
+        assert_eq!(
+            rows.iter()
+                .filter(|line| line.contains("edited description▏"))
+                .count(),
+            1
+        );
+        assert!(!rows[..38].iter().any(|line| line.contains("Description")
+            || line.contains("apply")
+            || line.contains("cancel")));
+        assert!(rows[38].contains("enter apply") && rows[38].contains("esc cancel"));
+        assert!(rows[39].contains("Description"));
+    }
+
+    #[test]
+    fn shared_prompts_and_destination_selection_do_not_repeat_footer_hints() {
+        let mut app = key_fixture();
+        for action in ["describe", "revset", "split", "plugin_prompt"] {
+            app.start_input(action, "Field context", "value".into(), false);
+            let lines = prompt_lines(&app, "│ ", 80);
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].to_string().ends_with("value▏"));
+            assert_eq!(footer_action_status(&app).as_deref(), Some("Field context"));
+        }
+        app.input = None;
+        rendered_rows(&mut app, 40);
+        let positions = app.hit_rows.clone();
+        press(&mut app, KeyCode::Char('S'));
+        let rows = rendered_rows(&mut app, 40);
+        assert_eq!(app.hit_rows, positions);
+        assert!(rows[39].contains("Squash 1 revision(s)"));
+        assert!(
+            !rows[..38]
+                .iter()
+                .any(|line| line.contains("apply") || line.contains("cancel"))
+        );
+    }
+
+    #[test]
     fn undo_confirmation_is_modal_and_does_not_shift_the_graph() {
         let mut app = key_fixture();
         rendered_rows(&mut app, 40);
@@ -4158,7 +4308,7 @@ mod tests {
         assert!((15..25).contains(&title_row));
         assert!(
             rows.iter()
-                .any(|row| row.contains("enter undo") && row.contains("esc cancel"))
+                .any(|row| row.contains("enter confirm") && row.contains("esc cancel"))
         );
         assert!(!rows.iter().any(|row| row.contains("[undo]")));
         assert_eq!(app.hit_rows, positions);
@@ -4202,8 +4352,135 @@ mod tests {
     }
 
     #[test]
+    fn omitted_ancestors_expand_temporarily_and_survive_refresh() {
+        let snapshot = Snapshot {
+            workspace_stale: false,
+            operation: "op".into(),
+            revisions: vec![Revision {
+                working_copy: true,
+                log_context: true,
+                parents: vec!["a".into()],
+                ..revision("work", "work")
+            }],
+            ancestors: vec![
+                Revision {
+                    outside_revset: true,
+                    immutable: true,
+                    bookmarks: vec!["old@origin".into()],
+                    parents: vec!["between".into(), "side".into()],
+                    description: "omitted ancestor".into(),
+                    ..revision("a", "alpha")
+                },
+                Revision {
+                    outside_revset: true,
+                    immutable: true,
+                    parents: vec!["older".into()],
+                    description: "between bookmarks".into(),
+                    ..revision("between", "between")
+                },
+                Revision {
+                    outside_revset: true,
+                    immutable: true,
+                    elide_bookmarks: true,
+                    bookmarks: vec!["older@origin".into()],
+                    parents: vec!["root".into()],
+                    ..revision("older", "older")
+                },
+                Revision {
+                    outside_revset: true,
+                    immutable: true,
+                    root: true,
+                    ..revision("root", "root")
+                },
+                Revision {
+                    outside_revset: true,
+                    immutable: true,
+                    parents: vec!["root".into()],
+                    ..revision("side", "side")
+                },
+            ],
+        };
+        let mut app = App::default();
+        let mut snapshot = snapshot;
+        snapshot.ancestors[1].parents = vec!["between-two".into()];
+        snapshot.ancestors.insert(
+            2,
+            Revision {
+                outside_revset: true,
+                immutable: true,
+                parents: vec!["older".into()],
+                ..revision("between-two", "between-two")
+            },
+        );
+        app.update(snapshot.clone());
+        let rows = rendered_rows(&mut app, 30);
+        // The collapsed graph is exactly the selected log plus its existing
+        // boundary, even when omitted history contains branches and merges.
+        let expected_graph = crate::graph::render(&snapshot.revisions);
+        assert_eq!(app.graph.len(), expected_graph.len() + 1);
+        for (actual, expected) in app.graph.iter().zip(&expected_graph) {
+            assert_eq!(actual.node, expected.node);
+            assert_eq!(actual.edge, expected.edge);
+            assert!(actual.boundary.is_none());
+        }
+        assert_eq!(
+            app.graph.last().unwrap().node,
+            *expected_graph.last().unwrap().boundary.as_ref().unwrap()
+        );
+        assert!(!rows.iter().any(|row| row.contains("ancestor revisions")));
+        assert!(!rows.iter().any(|row| row.contains("old@origin")));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(app.selected_elision().is_some());
+        assert!(
+            footer_hints(&app, 200)
+                .to_string()
+                .contains("enter show remote ancestry")
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.selected_id(), Some("a"));
+        assert!(
+            rendered_rows(&mut app, 30)
+                .iter()
+                .any(|row| row.contains("old@origin"))
+        );
+        let rows = rendered_rows(&mut app, 30);
+        assert!(rows.iter().any(|row| row.contains("older@origin")));
+        assert!(rows.iter().any(|row| row.contains("2 immutable revisions")));
+        assert!(!app.hidden_immutable.contains_key("side"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("~ 1 immutable revision"))
+        );
+        assert!(!rows.iter().any(|row| row.contains("between bookmarks")));
+        press(&mut app, KeyCode::Char('j'));
+        assert!(app.selected_elision().is_some());
+        assert!(app.ancestors_expanded);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.selected_id(), Some("between"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.selected_elision().is_some());
+        assert!(app.ancestors_expanded);
+        press(&mut app, KeyCode::Char('j'));
+        app.update(snapshot.clone());
+        assert_eq!(app.selected_id(), Some("older"));
+        assert!(app.hidden_immutable.contains_key("between"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.selected_elision().is_some());
+        assert!(app.expanded_immutable.is_empty());
+        assert!(!app.ancestors_expanded);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.selected_id(), Some("work"));
+        assert!(app.expanded_immutable.is_empty());
+        assert!(!app.ancestors_expanded);
+        assert_eq!(app.snapshot.as_ref().unwrap().revisions.len(), 2);
+    }
+
+    #[test]
     fn immutable_rows_expand_in_place_and_remain_expanded_after_refresh() {
         let snapshot = Snapshot {
+            ancestors: Vec::new(),
             workspace_stale: false,
             operation: "op".into(),
             revisions: vec![
@@ -4285,6 +4562,8 @@ mod tests {
         let mut app = key_fixture();
         let mut snapshot = app.full_snapshot.clone().unwrap();
         snapshot.revisions[1].immutable = true;
+        snapshot.revisions[1].parents = vec![snapshot.revisions[2].commit_id.clone()];
+        snapshot.revisions[2].immutable = true;
         app.update(snapshot);
         press(&mut app, KeyCode::Char('r'));
         press(&mut app, KeyCode::Char('j'));
@@ -4350,18 +4629,21 @@ mod tests {
     fn selection_follows_rewrites_and_survives_removal() {
         let mut app = App::default();
         app.update(Snapshot {
+            ancestors: Vec::new(),
             workspace_stale: false,
             operation: "1".into(),
             revisions: vec![revision("a", "x"), revision("b", "y")],
         });
         app.selection.select(Some(1));
         app.update(Snapshot {
+            ancestors: Vec::new(),
             workspace_stale: false,
             operation: "2".into(),
             revisions: vec![revision("c", "y"), revision("a", "x")],
         });
         assert_eq!(app.selection.selected(), Some(0));
         app.update(Snapshot {
+            ancestors: Vec::new(),
             workspace_stale: false,
             operation: "3".into(),
             revisions: vec![revision("a", "x")],
@@ -4369,6 +4651,7 @@ mod tests {
         assert_eq!(app.selection.selected(), Some(0));
         app.filter = "no match".into();
         app.update(Snapshot {
+            ancestors: Vec::new(),
             workspace_stale: false,
             operation: "4".into(),
             revisions: vec![revision("a", "x")],
@@ -4385,6 +4668,7 @@ mod tests {
         child.parents.push("parent".into());
         child.working_copy = true;
         app.update(Snapshot {
+            ancestors: Vec::new(),
             workspace_stale: false,
             operation: "op".into(),
             revisions: vec![
