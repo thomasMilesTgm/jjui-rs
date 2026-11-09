@@ -217,7 +217,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let mut state = ListState::default().with_selected(Some(menu.index));
     frame.render_stateful_widget(
         List::new(items)
-            .highlight_symbol("▸ ")
+            .highlight_symbol("")
             .highlight_style(Style::default().bg(Color::DarkGray)),
         parts[0],
         &mut state,

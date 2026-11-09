@@ -32,8 +32,12 @@ pub struct Revision {
     /// Keep the context selected by the default log visible, even if immutable.
     pub log_context: bool,
     pub outside_revset: bool,
+    /// UI projection state; normal immutable revisions are not dimmed.
+    #[serde(skip)]
+    pub expanded_history: bool,
     pub empty: bool,
     pub conflict: bool,
+    pub divergent: bool,
     pub bookmarks: Vec<String>,
     /// Untracked remote labels outside the normal log don't pin immutable rows.
     pub elide_bookmarks: bool,
@@ -270,11 +274,35 @@ impl Repository {
         )?;
         let mut revisions = Vec::new();
         let mut ancestor_revisions = Vec::new();
-        let mut stream = revset
+        let mut grouped = jj_lib::graph::TopoGroupedGraph::new(revset.stream_graph(), |id| id);
+        let priority = evaluate_revset(
+            repo.as_ref(),
+            self.workspace.settings(),
+            &self.root(),
+            self.workspace.workspace_name(),
+            &self
+                .workspace
+                .settings()
+                .get_string("revsets.log-graph-prioritize")?,
+        )?;
+        let included = revset.containing_fn();
+        let mut priorities = priority.stream();
+        while let Some(id) = priorities.next().await {
+            let id = id?;
+            // TopoGroupedGraph requires every prioritized node to be present.
+            if included(&id).await? {
+                grouped.prioritize_branch(id);
+            }
+        }
+        // Apply the limit after grouping, just as jj log does. Truncating its
+        // input can exclude the working-copy branch or strand a prioritized node.
+        let mut stream = grouped
             .stream()
             .take(self.limit)
+            .map(|node| node.map(|(id, _edges)| id))
             .map(|id| (id, false))
-            .chain(ancestors.stream().take(self.limit).map(|id| (id, true)));
+            .chain(ancestors.stream().take(self.limit).map(|id| (id, true)))
+            .boxed_local();
         while let Some((id, outside_revset)) = stream.next().await {
             let id = id?;
             let commit = repo.store().get_commit_async(&id).await?;
@@ -314,8 +342,13 @@ impl Repository {
                 immutable: is_immutable(&id).await?,
                 log_context: log_context && !outside_revset,
                 outside_revset,
+                expanded_history: false,
                 empty: commit.is_empty(repo.index()).await?,
                 conflict: commit.has_conflict(),
+                divergent: repo
+                    .resolve_change_id(commit.change_id())
+                    .await?
+                    .is_some_and(|targets| targets.is_divergent()),
                 bookmarks,
                 elide_bookmarks,
                 tags: repo

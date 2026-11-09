@@ -233,6 +233,48 @@ fn watches_shared_repository_from_secondary_workspace() {
 }
 
 #[test]
+fn divergent_markers_follow_visible_change_versions_not_the_displayed_revset() {
+    let temp = fixture();
+    let base = heads(temp.path())[0].clone();
+    jj(temp.path(), &["describe", "-m", "left version"]);
+    jj(
+        temp.path(),
+        &["--at-operation", &base, "describe", "-m", "right version"],
+    );
+    jj(temp.path(), &["new", "root()", "-m", "unrelated work"]);
+    let before = heads(temp.path());
+    let all = snapshot(temp.path());
+    let divergent: Vec<_> = all["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["divergent"] == true)
+        .collect();
+    assert_eq!(divergent.len(), 2);
+    assert_eq!(divergent[0]["change_id"], divergent[1]["change_id"]);
+    let read_one = |id: &str| {
+        let output = viewer(temp.path())
+            .args(["--once", "-r", id, "--limit", "1"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let first = divergent[0]["commit_id"].as_str().unwrap();
+    let other = divergent[1]["commit_id"].as_str().unwrap();
+    assert_eq!(read_one(first)["revisions"][0]["divergent"], true);
+    assert_eq!(heads(temp.path()), before);
+    jj(temp.path(), &["abandon", other]);
+    let before = heads(temp.path());
+    assert_eq!(read_one(first)["revisions"][0]["divergent"], false);
+    assert_eq!(heads(temp.path()), before);
+}
+
+#[test]
 fn divergent_operations_are_reported_without_reconciliation() {
     let temp = fixture();
     let before = heads(temp.path());
@@ -738,6 +780,92 @@ fn tags_appear_and_disappear_in_native_live_snapshots() {
                 .iter()
                 .all(|r| r["tags"].as_array().unwrap().is_empty())
     });
+}
+
+#[test]
+fn graph_order_matches_jj_with_interleaved_branches_and_limits() {
+    let temp = fixture();
+    jj(temp.path(), &["bookmark", "create", "base"]);
+    jj(temp.path(), &["new", "-m", "a1"]);
+    jj(temp.path(), &["bookmark", "create", "a1"]);
+    jj(temp.path(), &["new", "base", "-m", "b1"]);
+    jj(temp.path(), &["bookmark", "create", "b1"]);
+    jj(temp.path(), &["new", "a1", "-m", "a2"]);
+    jj(temp.path(), &["bookmark", "create", "a2"]);
+    jj(temp.path(), &["new", "b1", "-m", "b2"]);
+    jj(temp.path(), &["bookmark", "create", "b2"]);
+    jj(temp.path(), &["edit", "a2"]);
+    for merge in [false, true] {
+        if merge {
+            jj(temp.path(), &["new", "a2", "b2", "-m", "merge"]);
+        }
+        let before = heads(temp.path());
+        for priority in ["present(@)", "b2", "none()", "root()"] {
+            let config = temp.path().join(".jj/order-config.toml");
+            std::fs::write(
+                &config,
+                format!("[revsets]\nlog-graph-prioritize = '{priority}'\n"),
+            )
+            .unwrap();
+            for limit in [1, 3, 200] {
+                for revset in ["builtin_log()", "b2::b2 | b1"] {
+                    let expected = Command::new("jj")
+                        .current_dir(temp.path())
+                        .env("JJ_CONFIG", &config)
+                        .args([
+                            "--ignore-working-copy",
+                            "log",
+                            "--color",
+                            "never",
+                            "-r",
+                            revset,
+                            "--limit",
+                            &limit.to_string(),
+                            "-T",
+                            "'COMMIT:' ++ commit_id ++ \"\\n\"",
+                        ])
+                        .output()
+                        .unwrap();
+                    assert!(
+                        expected.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&expected.stderr)
+                    );
+                    let expected: Vec<_> = String::from_utf8(expected.stdout)
+                        .unwrap()
+                        .lines()
+                        .filter_map(|line| line.split_once("COMMIT:").map(|(_, id)| id.to_owned()))
+                        .collect();
+                    let output = viewer(temp.path())
+                        .env("JJ_CONFIG", &config)
+                        .args(["--once", "--limit", &limit.to_string(), "-r", revset])
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    let actual: Vec<_> = actual["revisions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|r| r["commit_id"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(
+                        actual, expected,
+                        "priority={priority}, limit={limit}, revset={revset}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            heads(temp.path()),
+            before,
+            "native graph reads must not write operations"
+        );
+    }
 }
 
 #[test]

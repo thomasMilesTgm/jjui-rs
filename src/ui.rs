@@ -1981,12 +1981,12 @@ impl App {
         } else {
             snapshot.revisions.clone()
         };
-        if self.ancestors_expanded {
-            for revision in &mut history {
-                if revision.outside_revset {
-                    revision.outside_revset = false;
-                    revision.elide_bookmarks = false;
-                }
+        for revision in &mut history {
+            revision.expanded_history = self.expanded_immutable.contains(&revision.commit_id)
+                || (self.ancestors_expanded && revision.outside_revset);
+            if self.ancestors_expanded && revision.outside_revset {
+                revision.outside_revset = false;
+                revision.elide_bookmarks = false;
             }
         }
         self.expanded_immutable
@@ -2506,7 +2506,14 @@ fn prompt_lines(app: &App, prefix: &str, width: usize) -> Vec<Line<'static>> {
             let size = Span::raw(c.to_string()).width();
             if c == '\n' || used + size > available {
                 result.push(Line::from(vec![
-                    Span::styled(prefix.clone(), Style::default().fg(Color::Green)),
+                    Span::styled(
+                        prefix.clone(),
+                        app.snapshot
+                            .as_ref()
+                            .and_then(|s| app.selection.selected().and_then(|i| s.revisions.get(i)))
+                            .map(revision_graph_style)
+                            .unwrap_or_else(|| Style::default().fg(Color::Reset)),
+                    ),
                     Span::styled(
                         std::mem::take(&mut line),
                         Style::default().fg(Color::Yellow),
@@ -2611,7 +2618,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             List::new(choice.options.clone())
                 .block(Block::bordered().title(choice.title.clone()))
                 .highlight_style(Style::default().bg(Color::DarkGray))
-                .highlight_symbol("▸ "),
+                .highlight_symbol(""),
             popup,
             &mut state,
         );
@@ -3254,7 +3261,7 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App) {
         frame.render_stateful_widget(
             List::new(items)
                 .highlight_style(Style::default().bg(Color::DarkGray))
-                .highlight_symbol("▸ "),
+                .highlight_symbol(""),
             body,
             &mut state,
         );
@@ -3330,11 +3337,23 @@ fn log_id_width(id: &str, prefix_len: usize, color: Color, width: usize) -> Vec<
 }
 
 fn revision_graph_style(revision: &crate::repository::Revision) -> Style {
-    Style::default().fg(if revision.immutable {
+    Style::default().fg(if revision.expanded_history {
         Color::DarkGray
     } else {
-        Color::Green
+        Color::Reset
     })
+}
+
+fn graph_node_spans(node: &str, style: Style) -> Vec<Span<'static>> {
+    if let Some((before, after)) = node.split_once('@') {
+        vec![
+            Span::styled(before.to_owned(), style),
+            Span::styled("@", style.fg(Color::Green)),
+            Span::styled(after.to_owned(), style),
+        ]
+    } else {
+        vec![Span::styled(node.to_owned(), style)]
+    }
 }
 
 fn revision_header(
@@ -3344,10 +3363,7 @@ fn revision_header(
     editor: Option<&crate::input::Input>,
 ) -> Line<'static> {
     let wc = revision.working_copy;
-    let mut spans = vec![Span::styled(
-        node.to_owned(),
-        revision_graph_style(revision),
-    )];
+    let mut spans = graph_node_spans(node, revision_graph_style(revision));
     spans.extend(log_id(
         &revision.change_id,
         revision.change_prefix_len,
@@ -3426,6 +3442,12 @@ fn revision_header(
             Style::default().fg(Color::Magenta),
         ));
     }
+    if revision.divergent {
+        spans.push(Span::styled(
+            " (divergent)",
+            Style::default().fg(if wc { Color::LightRed } else { Color::Red }),
+        ));
+    }
     if revision.conflict {
         spans.push(Span::styled(
             " (conflict)",
@@ -3500,18 +3522,12 @@ fn operation_lines(
     } else {
         Color::Cyan
     };
-    let mut spans = vec![
-        Span::styled(outer.to_owned(), Style::default().fg(Color::Green)),
-        Span::styled(
-            graph.node.clone(),
-            if op.current {
-                style.fg(Color::Green)
-            } else {
-                Style::default()
-            },
-        ),
-        Span::raw(" "),
-    ];
+    let mut spans = vec![Span::styled(
+        outer.to_owned(),
+        Style::default().fg(Color::Reset),
+    )];
+    spans.extend(graph_node_spans(&graph.node, style.fg(Color::Reset)));
+    spans.push(Span::raw(" "));
     spans.extend(log_id_width(&row.id, op.prefix_len, blue, 12));
     if !op.bookmarks.is_empty() {
         spans.push(Span::styled(
@@ -3548,7 +3564,7 @@ fn operation_lines(
     let mut lines = vec![Line::from(spans).style(style)];
     lines.push(
         Line::from(vec![
-            Span::styled(outer.to_owned(), Style::default().fg(Color::Green)),
+            Span::styled(outer.to_owned(), Style::default().fg(Color::Reset)),
             Span::raw(format!("{} ", graph.edge)),
             Span::raw(op.description.lines().next().unwrap_or_default().to_owned()),
         ])
@@ -3558,7 +3574,7 @@ fn operation_lines(
         for text in attribute.lines() {
             lines.push(
                 Line::from(vec![
-                    Span::styled(outer.to_owned(), Style::default().fg(Color::Green)),
+                    Span::styled(outer.to_owned(), Style::default().fg(Color::Reset)),
                     Span::raw(format!("{} ", graph.continuation)),
                     Span::styled(
                         text.to_owned(),
@@ -3575,8 +3591,8 @@ fn operation_lines(
     }
     if let Some(boundary) = &graph.boundary {
         lines.push(Line::from(vec![
-            Span::styled(outer.to_owned(), Style::default().fg(Color::Green)),
-            Span::styled(boundary.clone(), Style::default().fg(Color::DarkGray)),
+            Span::styled(outer.to_owned(), Style::default().fg(Color::Reset)),
+            Span::styled(boundary.clone(), Style::default().fg(Color::Reset)),
         ]));
     }
     lines
@@ -3615,11 +3631,7 @@ fn draw_operations(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
             items.push(ListItem::new(line));
         }
         if index == app.browse_index && app.input.is_some() {
-            for line in prompt_lines(
-                app,
-                &graph.continuation,
-                content.width.saturating_sub(2) as usize,
-            ) {
+            for line in prompt_lines(app, &graph.continuation, content.width as usize) {
                 selected = Some(items.len());
                 indices.push(index);
                 items.push(ListItem::new(line));
@@ -3638,7 +3650,7 @@ fn draw_operations(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app:
         List::new(items)
             .block(block)
             .highlight_style(Style::default().bg(Color::Indexed(236)))
-            .highlight_symbol("▸ "),
+            .highlight_symbol(""),
         area,
         &mut app.operation_selection,
     );
@@ -3770,8 +3782,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                     .is_some_and(|input| input.action == "describe");
             let mut prompt_focus = None;
             if describing {
-                for line in prompt_lines(app, &graph.edge, content.width.saturating_sub(2) as usize)
-                {
+                for line in prompt_lines(app, &graph.edge, content.width as usize) {
                     prompt_focus = Some(items.len());
                     targets.push((i, None));
                     items.push(ListItem::new(line));
@@ -3787,11 +3798,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                 && app.view != View::Bookmarks
                 && (app.view != View::InlineOperations || app.listing.is_empty())
             {
-                for line in prompt_lines(
-                    app,
-                    &graph.continuation,
-                    content.width.saturating_sub(2) as usize,
-                ) {
+                for line in prompt_lines(app, &graph.continuation, content.width as usize) {
                     prompt_focus = Some(items.len());
                     targets.push((i, None));
                     items.push(ListItem::new(line));
@@ -3837,7 +3844,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                         for line in prompt_lines(
                             app,
                             &format!("{}  {}", graph.continuation, op_graph.continuation),
-                            content.width.saturating_sub(2) as usize,
+                            content.width as usize,
                         ) {
                             prompt_focus = Some(items.len());
                             targets.push((i, None));
@@ -3950,11 +3957,9 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
                             ])));
                         }
                         if index == editor.index && app.input.is_some() {
-                            for line in prompt_lines(
-                                app,
-                                &graph.continuation,
-                                content.width.saturating_sub(2) as usize,
-                            ) {
+                            for line in
+                                prompt_lines(app, &graph.continuation, content.width as usize)
+                            {
                                 prompt_focus = Some(items.len());
                                 targets.push((i, None));
                                 items.push(ListItem::new(line));
@@ -3986,7 +3991,7 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
         List::new(items)
             .block(block)
             .highlight_style(Style::default().bg(Color::Indexed(236)))
-            .highlight_symbol("▸ "),
+            .highlight_symbol(""),
         area,
         &mut app.graph_selection,
     );
@@ -3994,10 +3999,10 @@ fn draw_graph(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &mut
         let offset = app.graph_selection.offset();
         if row >= offset
             && row - offset < content.height as usize
-            && column + 2 < content.width as usize
+            && column < content.width as usize
         {
             frame.set_cursor_position((
-                content.x + 2 + column as u16,
+                content.x + column as u16,
                 content.y + (row - offset) as u16,
             ));
         }
@@ -4182,7 +4187,7 @@ fn draw_bookmarks(frame: &mut ratatui::Frame, body: ratatui::layout::Rect, app: 
     frame.render_stateful_widget(
         List::new(items)
             .highlight_style(Style::default().bg(Color::DarkGray))
-            .highlight_symbol("▸ "),
+            .highlight_symbol(""),
         list_area,
         &mut state,
     );
@@ -4429,6 +4434,14 @@ mod tests {
         );
         assert!(!rows.iter().any(|row| row.contains("ancestor revisions")));
         assert!(!rows.iter().any(|row| row.contains("old@origin")));
+        assert!(
+            app.snapshot
+                .as_ref()
+                .unwrap()
+                .revisions
+                .iter()
+                .all(|r| { revision_graph_style(r).fg == Some(Color::Reset) })
+        );
         press(&mut app, KeyCode::Char('j'));
         assert!(app.selected_elision().is_some());
         assert!(
@@ -4438,6 +4451,16 @@ mod tests {
         );
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.selected_id(), Some("a"));
+        for revision in &app.snapshot.as_ref().unwrap().revisions {
+            assert_eq!(
+                revision_graph_style(revision).fg,
+                Some(if revision.commit_id == "work" {
+                    Color::Reset
+                } else {
+                    Color::DarkGray
+                })
+            );
+        }
         assert!(
             rendered_rows(&mut app, 30)
                 .iter()
@@ -4469,6 +4492,14 @@ mod tests {
         assert!(app.selected_elision().is_some());
         assert!(app.expanded_immutable.is_empty());
         assert!(!app.ancestors_expanded);
+        assert!(
+            app.snapshot
+                .as_ref()
+                .unwrap()
+                .revisions
+                .iter()
+                .all(|r| { revision_graph_style(r).fg == Some(Color::Reset) })
+        );
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('k'));
         assert_eq!(app.selected_id(), Some("work"));
@@ -4512,6 +4543,14 @@ mod tests {
         app.update(snapshot.clone());
         assert_eq!(app.snapshot.as_ref().unwrap().revisions.len(), 3);
         let rows = rendered_rows(&mut app, 30);
+        assert!(
+            app.snapshot
+                .as_ref()
+                .unwrap()
+                .revisions
+                .iter()
+                .all(|r| { revision_graph_style(r).fg == Some(Color::Reset) })
+        );
         assert!(
             rows.iter()
                 .any(|row| row.contains("~ 2 immutable revisions"))
@@ -4606,10 +4645,46 @@ mod tests {
             assert_eq!(span.style.add_modifier.contains(Modifier::BOLD), bold);
         }
         revision.working_copy = true;
+        revision.divergent = true;
+        let line = revision_header(&revision, "@ ", false, None);
+        let marker = line
+            .spans
+            .iter()
+            .find(|span| span.content == " (divergent)")
+            .unwrap();
+        assert_eq!(marker.style.fg, Some(Color::LightRed));
+        revision.working_copy = false;
+        let line = revision_header(&revision, "○ ", false, None);
+        let marker = line
+            .spans
+            .iter()
+            .find(|span| span.content == " (divergent)")
+            .unwrap();
+        assert_eq!(marker.style.fg, Some(Color::Red));
+        assert!(line.to_string().ends_with("03a6cacb (divergent)"));
+        revision.divergent = false;
+        revision.working_copy = true;
         revision.empty = true;
         let line = revision_header(&revision, "@ ", false, None);
         assert!(line.style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(line.spans[1].style.fg, Some(Color::LightMagenta));
+        assert_eq!(
+            line.spans
+                .iter()
+                .find(|s| s.content == "yq")
+                .unwrap()
+                .style
+                .fg,
+            Some(Color::LightMagenta)
+        );
+        assert_eq!(
+            line.spans
+                .iter()
+                .find(|s| s.content == "@")
+                .unwrap()
+                .style
+                .fg,
+            Some(Color::Green)
+        );
         assert_eq!(
             revision_description(&revision, "│ ").to_string(),
             "│ (empty) (no description set)"
@@ -4865,6 +4940,20 @@ mod tests {
             .collect()
     }
 
+    fn highlighted_rows(app: &mut App, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(120)
+            .filter(|row| row.iter().any(|cell| cell.bg != Color::Reset))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
     fn operation_fixture(count: usize) -> Vec<crate::browser::Row> {
         (0..count)
             .map(|i| crate::browser::Row {
@@ -4983,19 +5072,11 @@ mod tests {
             app.browse_index = 0;
             press(&mut app, KeyCode::End);
             assert_eq!(app.browse_index, 39);
-            let lines = rendered_rows(&mut app, 14);
-            assert!(
-                lines
-                    .iter()
-                    .any(|line| line.contains("000000000027") && line.contains('▸'))
-            );
+            let lines = highlighted_rows(&mut app, 14);
+            assert!(lines.iter().any(|line| line.contains("000000000027")));
             press(&mut app, KeyCode::Home);
-            let lines = rendered_rows(&mut app, 14);
-            assert!(
-                lines
-                    .iter()
-                    .any(|line| line.contains("000000000000") && line.contains('▸'))
-            );
+            let lines = highlighted_rows(&mut app, 14);
+            assert!(lines.iter().any(|line| line.contains("000000000000")));
         }
     }
 
@@ -5456,7 +5537,12 @@ mod tests {
         assert!(child_row < file_row && file_row < parent_after);
         assert_eq!(parent_after, parent_before + 2);
         assert!(expanded[file_row].contains("│   M  changed.txt"));
-        assert!(expanded[file_row].contains('▸'));
+        assert!(!expanded.iter().any(|line| line.contains('▸')));
+        assert!(
+            highlighted_rows(&mut app, 30)
+                .iter()
+                .any(|line| line.contains("changed.txt"))
+        );
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.view, View::Files);
@@ -5489,16 +5575,21 @@ mod tests {
             press(&mut app, KeyCode::Down);
         }
         assert!(
-            rendered_rows(&mut app, 12)
+            highlighted_rows(&mut app, 12)
                 .iter()
-                .any(|line| line.contains("file-39.txt") && line.contains('▸'))
+                .any(|line| line.contains("file-39.txt"))
         );
         press(&mut app, KeyCode::Left);
         let collapsed = rendered_rows(&mut app, 12);
         assert!(
-            collapsed.iter().any(|line| line.contains("match-on")
-                && line.contains("child")
-                && line.contains('▸'))
+            collapsed
+                .iter()
+                .any(|line| line.contains("match-on") && line.contains("child"))
+        );
+        assert!(
+            highlighted_rows(&mut app, 12)
+                .iter()
+                .any(|line| line.contains("child"))
         );
         assert!(!collapsed.iter().any(|line| line.contains("file-")));
     }

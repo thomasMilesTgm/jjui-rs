@@ -26,6 +26,7 @@ auto-track = "all()"
 max-new-file-size = "1MiB"
 [revsets]
 log = "builtin_log()"
+log-graph-prioritize = "present(@)"
 "#,
     )?);
     let paths = if let Some(paths) = std::env::var_os("JJ_CONFIG") {
