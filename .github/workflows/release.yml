@@ -67,10 +67,18 @@ jobs:
             --source source \
             --binary 'source/target/${{ matrix.target }}/release/jjui-rs' \
             --target '${{ matrix.target }}' --output dist
+      - name: Package Debian binary
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev binutils
+          architecture=$(dpkg --print-architecture)
+          python3 automation/scripts/package-deb.py \
+            --version "$RELEASE_TAG" --architecture "$architecture" \
+            --archive "dist/jjui-rs-$RELEASE_TAG-${{ matrix.target }}.tar.gz" --output dist
       - uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.target }}
-          path: dist/*.tar.gz
+          path: dist/*
           if-no-files-found: error
 
   aur:
@@ -99,7 +107,7 @@ jobs:
           tar -czf "dist/jjui-rs-$RELEASE_TAG-aur.tar.gz" -C generated \
             jjui-rs jjui-rs-bin jjui-rs-git
           cd dist
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum *.tar.gz *.deb > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: release-assets

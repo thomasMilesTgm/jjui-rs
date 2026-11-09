@@ -1,0 +1,90 @@
+name: Package existing Debian release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub release with Linux archives
+        required: true
+        type: string
+      revision:
+        description: Debian packaging revision (increase when changing package metadata)
+        required: true
+        default: '1'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debian-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+  DEB_REVISION: ${{ inputs.revision }}
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download and verify original release archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$DEB_REVISION" =~ ^[1-9][0-9]*$ ]]
+          gh release download "$RELEASE_TAG" --dir downloads \
+            --pattern "jjui-rs-$RELEASE_TAG-$TARGET.tar.gz" --pattern SHA256SUMS
+          cd downloads
+          sha256sum --check --ignore-missing SHA256SUMS
+      - name: Build Debian package
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev binutils
+          python3 scripts/package-deb.py --version "$RELEASE_TAG" \
+            --revision "$DEB_REVISION" --architecture '${{ matrix.architecture }}' \
+            --archive "downloads/jjui-rs-$RELEASE_TAG-${{ matrix.target }}.tar.gz" --output dist
+          sudo apt-get install -y ./dist/*.deb
+          jjui-rs --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.architecture }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          merge-multiple: true
+          path: dist
+      - name: Attach packages without replacing existing archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          sha256sum *.deb > "DEB-$DEB_REVISION-SHA256SUMS"
+          gh release upload "$RELEASE_TAG" ./*
