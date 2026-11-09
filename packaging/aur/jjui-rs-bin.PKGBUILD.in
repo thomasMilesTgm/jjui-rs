@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: 0BSD
+pkgname=jjui-rs-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='A live terminal UI for Jujutsu with native repository access'
+arch=('x86_64' 'aarch64')
+url='https://github.com/thomasMilesTgm/jjui-rs'
+license=('MIT OR Apache-2.0')
+depends=('glibc' 'gcc-libs' 'jujutsu>=@JJ_MIN@' 'jujutsu<@JJ_MAX@')
+provides=("jjui-rs=$pkgver")
+conflicts=('jjui-rs')
+options=('!strip' '!debug')
+source_x86_64=("$url/releases/download/$pkgver/jjui-rs-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("$url/releases/download/$pkgver/jjui-rs-$pkgver-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
+
+package() {
+  cd "$srcdir/jjui-rs-$pkgver-$CARCH-unknown-linux-gnu"
+  install -Dm755 jjui-rs "$pkgdir/usr/bin/jjui-rs"
+  install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir/usr/share/licenses/$pkgname"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/*.md -t "$pkgdir/usr/share/doc/$pkgname/docs"
+  install -Dm644 keybinds/*.toml -t "$pkgdir/usr/share/jjui-rs/keybinds"
+  install -Dm644 themes/*.toml -t "$pkgdir/usr/share/jjui-rs/themes"
+  cp -r examples "$pkgdir/usr/share/jjui-rs/"
+}

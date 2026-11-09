@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: 0BSD
+pkgname=jjui-rs
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='A live terminal UI for Jujutsu with native repository access'
+arch=('x86_64' 'aarch64')
+url='https://github.com/thomasMilesTgm/jjui-rs'
+license=('MIT OR Apache-2.0')
+depends=('glibc' 'gcc-libs' 'jujutsu>=@JJ_MIN@' 'jujutsu<@JJ_MAX@')
+makedepends=('cargo' 'rust>=@RUST_VERSION@')
+source=("https://static.crates.io/crates/jjui-rs/jjui-rs-$pkgver.crate")
+sha256sums=('@CRATE_SHA256@')
+
+prepare() {
+  cd "$srcdir/jjui-rs-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "$srcdir/jjui-rs-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --target "$CARCH-unknown-linux-gnu"
+}
+
+check() {
+  cd "$srcdir/jjui-rs-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release --target "$CARCH-unknown-linux-gnu"
+}
+
+package() {
+  cd "$srcdir/jjui-rs-$pkgver"
+  install -Dm755 "target/$CARCH-unknown-linux-gnu/release/jjui-rs" "$pkgdir/usr/bin/jjui-rs"
+  install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir/usr/share/licenses/$pkgname"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 docs/*.md -t "$pkgdir/usr/share/doc/$pkgname/docs"
+  install -Dm644 keybinds/*.toml -t "$pkgdir/usr/share/jjui-rs/keybinds"
+  install -Dm644 themes/*.toml -t "$pkgdir/usr/share/jjui-rs/themes"
+  cp -r examples "$pkgdir/usr/share/jjui-rs/"
+}
