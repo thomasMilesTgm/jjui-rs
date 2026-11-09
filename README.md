@@ -30,6 +30,11 @@ cargo install jjui-rs --force
   differences, and a red prompt for major/minor differences. A new major/minor requires a matching
   jjui-rs release.
 
+### Debian and Ubuntu packaging
+
+Debian packages and a signed APT feed are being prepared for amd64 and arm64. See the
+[setup and release instructions](https://github.com/thomasMilesTgm/jjui-rs/blob/main/docs/debian.md).
+
 ## Why another jj UI?
 
 Direct repository access keeps history current without spawning a command for each refresh.

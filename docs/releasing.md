@@ -49,3 +49,11 @@ Publication is a separate, explicit step. Confirm the published version installs
 After publishing to crates.io, push the matching version tag. The release workflow builds x86-64 and
 ARM64 Linux archives and publishes a GitHub release with checksums and generated AUR recipes. See
 [AUR packaging](aur.md) for validation, initial submission, and updating the three packages.
+
+## Debian packages and APT
+
+New release builds also produce amd64 and arm64 `.deb` packages. The signed APT workflow runs after
+release publication and retains packages from older stable releases. To add Debian packages to an
+existing release, run **Package existing Debian release** rather than rebuilding its binary
+archives. See [Debian packaging](debian.md) for installation, signing-key maintenance, and
+validation.
