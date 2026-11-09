@@ -1,6 +1,6 @@
 use crate::repository::{Repository, Snapshot};
 use anyhow::Result;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind};
 use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, SyncSender},
@@ -62,7 +62,7 @@ fn worktree_path(root: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
     if relative
         .components()
-        .any(|c| matches!(c.as_os_str().to_str(), Some(".jj" | ".git" | "target")))
+        .any(|c| matches!(c.as_os_str().to_str(), Some(".jj" | ".git")))
     {
         return None;
     }
@@ -93,14 +93,7 @@ pub fn start(
     let root = repo.root();
     let metadata = repo.repo_path();
     let (events_send, events) = mpsc::sync_channel(1024);
-    let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {
-        // A full queue already guarantees a refresh; never block the OS watcher.
-        let _ = events_send.try_send(event);
-    })?;
-    watcher.watch(&root, RecursiveMode::Recursive)?;
-    if !metadata.starts_with(&root) {
-        watcher.watch(&metadata, RecursiveMode::Recursive)?;
-    }
+    let watcher = crate::watching::start(root.clone(), metadata.clone(), events_send)?;
     let live_root = root.clone();
     thread::spawn(move || {
         let _watcher = watcher;
@@ -331,7 +324,6 @@ mod tests {
         for path in [
             "/repo/.jj/repo/op_heads/a",
             "/repo/.git/HEAD",
-            "/repo/target/a",
             "/elsewhere/a",
         ] {
             assert_eq!(worktree_path(root, Path::new(path)), None);

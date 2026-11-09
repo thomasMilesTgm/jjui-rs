@@ -188,6 +188,33 @@ fn streams_external_operations_and_unsnapshotted_file_events() {
 }
 
 #[test]
+fn watches_new_directories_and_reloads_ignore_rules() {
+    let temp = fixture();
+    std::fs::create_dir_all(temp.path().join("target/tracked")).unwrap();
+    std::fs::write(temp.path().join("target/tracked/known.txt"), "tracked").unwrap();
+    jj(temp.path(), &["status"]);
+    std::fs::create_dir_all(temp.path().join("ignored/deep")).unwrap();
+    std::fs::write(temp.path().join(".gitignore"), "ignored/\ntarget/\n").unwrap();
+    let before = heads(temp.path());
+    let watch = Watch::new(temp.path());
+    watch.until(|v| v["type"] == "repository");
+    let changed = |v: &Value, path: &str| {
+        v["type"] == "files" && v["paths"].as_array().unwrap().iter().any(|p| p == path)
+    };
+    std::fs::create_dir_all(temp.path().join("src/nested")).unwrap();
+    watch.until(|v| changed(v, "src"));
+    std::fs::write(temp.path().join("src/nested/new.txt"), "new file").unwrap();
+    watch.until(|v| changed(v, "src/nested/new.txt"));
+    std::fs::write(temp.path().join("target/tracked/known.txt"), "changed").unwrap();
+    watch.until(|v| changed(v, "target/tracked/known.txt"));
+    std::fs::write(temp.path().join(".gitignore"), "").unwrap();
+    watch.until(|v| changed(v, ".gitignore"));
+    std::fs::write(temp.path().join("ignored/deep/now-visible.txt"), "visible").unwrap();
+    watch.until(|v| changed(v, "ignored/deep/now-visible.txt"));
+    assert_eq!(heads(temp.path()), before, "watching must remain read-only");
+}
+
+#[test]
 fn watches_shared_repository_from_secondary_workspace() {
     let temp = fixture();
     let other = temp.path().join("other");

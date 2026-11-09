@@ -16,6 +16,7 @@ mod settings;
 mod snapshot;
 mod theme;
 mod ui;
+mod watching;
 mod workspaces;
 
 use anyhow::{Result, bail};

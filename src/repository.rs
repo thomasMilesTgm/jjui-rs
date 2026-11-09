@@ -182,6 +182,26 @@ impl Repository {
         self.workspace.repo_path().to_owned()
     }
 
+    pub fn tracked_directories(&self) -> Result<std::collections::HashSet<PathBuf>> {
+        let mut directories = std::collections::HashSet::new();
+        if let Some(wc) = self
+            .workspace
+            .working_copy()
+            .downcast_ref::<jj_lib::local_working_copy::LocalWorkingCopy>()
+        {
+            for path in wc.file_states()?.paths() {
+                let mut parent = path.parent();
+                while let Some(path) = parent {
+                    if !directories.insert(path.to_fs_path(&self.root())?) {
+                        break;
+                    }
+                    parent = path.parent();
+                }
+            }
+        }
+        Ok(directories)
+    }
+
     pub async fn refresh(&mut self, force: bool) -> Result<Option<Snapshot>> {
         self.reload_workspace()?;
         let loader = self.workspace.repo_loader();

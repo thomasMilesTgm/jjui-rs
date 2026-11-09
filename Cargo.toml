@@ -1,6 +1,6 @@
 [package]
 name = "jjui-rs"
-version = "0.47.1"
+version = "0.47.2"
 edition = "2024"
 rust-version = "1.97.1"
 description = "A live terminal UI for Jujutsu with native repository access"
@@ -29,6 +29,7 @@ crossterm = "0.29"
 futures = "0.3"
 jj-lib = "0.47"
 notify = "8"
+ignore = "0.4"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
