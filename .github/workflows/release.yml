@@ -1,0 +1,128 @@
+name: Release Linux binaries and AUR recipes
+
+on:
+  push:
+    tags: ['[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (the crate must already be published)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: automation
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          path: source
+          persist-credentials: false
+      - name: Validate tag and select Rust toolchain
+        working-directory: source
+        run: |
+          python3 - <<'PY'
+          import os, re, tomllib
+          from pathlib import Path
+          package = tomllib.loads(Path('Cargo.toml').read_text())['package']
+          tag = os.environ['RELEASE_TAG']
+          assert re.fullmatch(r'\d+\.\d+\.\d+', tag), 'expected a stable version tag'
+          assert package['version'] == tag, 'tag must match Cargo.toml'
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f"RUSTUP_TOOLCHAIN={package['rust-version']}\n")
+          PY
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Build
+        working-directory: source
+        run: cargo build --locked --release --target '${{ matrix.target }}'
+      - name: Package binary, licenses, presets, and examples
+        run: |
+          python3 automation/scripts/package-release.py \
+            --source source \
+            --binary 'source/target/${{ matrix.target }}/release/jjui-rs' \
+            --target '${{ matrix.target }}' --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  aur:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container: archlinux:base-devel
+    steps:
+      - name: Install packaging tools
+        run: pacman -Syu --noconfirm python git
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Test and generate AUR packages and checksums
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- python tests/packaging.py
+          runuser -u builder -- python scripts/prepare-aur.py \
+            --version "$RELEASE_TAG" --assets dist --output generated
+          tar -czf "dist/jjui-rs-$RELEASE_TAG-aur.tar.gz" -C generated \
+            jjui-rs jjui-rs-bin jjui-rs-git
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: aur
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "$RELEASE_TAG"
+          fi
+          # Do not replace published bytes: AUR checksums must remain valid.
+          gh release upload "$RELEASE_TAG" dist/*

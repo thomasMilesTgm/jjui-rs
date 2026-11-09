@@ -43,3 +43,9 @@ cargo publish --locked
 Publication is a separate, explicit step. Confirm the published version installs with
 `cargo install jjui-rs --version 0.47.0 --locked` and reports the expected version with
 `jjui-rs --version`. Update the version in that command for later releases.
+
+## Linux binaries and AUR
+
+After publishing to crates.io, push the matching version tag. The release workflow builds x86-64 and
+ARM64 Linux archives and publishes a GitHub release with checksums and generated AUR recipes. See
+[AUR packaging](aur.md) for validation, initial submission, and updating the three packages.
