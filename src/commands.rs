@@ -86,13 +86,19 @@ impl CommandSpec {
     }
 }
 
-fn collect(mut input: impl Read) -> String {
+/// Receives command output as it is produced.
+pub type OutputSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+fn collect(mut input: impl Read, sink: Option<OutputSink>) -> String {
     let mut output = Vec::new();
     let mut buffer = [0; 8192];
     let mut truncated = false;
     while let Ok(count) = input.read(&mut buffer) {
         if count == 0 {
             break;
+        }
+        if let Some(sink) = &sink {
+            sink(&String::from_utf8_lossy(&buffer[..count]));
         }
         let keep = count.min((2 * 1024 * 1024usize).saturating_sub(output.len()));
         output.extend_from_slice(&buffer[..keep]);
@@ -118,7 +124,20 @@ pub fn execute(root: &Path, spec: &CommandSpec) -> Result<String> {
     execute_process(spec.process(root)?, &spec.display())
 }
 
-pub(crate) fn execute_process(mut process: Command, display: &str) -> Result<String> {
+/// Like [`execute`], streaming stdout and stderr to `sink` while it runs.
+pub fn execute_streaming(root: &Path, spec: &CommandSpec, sink: OutputSink) -> Result<String> {
+    execute_process_with(spec.process(root)?, &spec.display(), Some(sink))
+}
+
+pub(crate) fn execute_process(process: Command, display: &str) -> Result<String> {
+    execute_process_with(process, display, None)
+}
+
+fn execute_process_with(
+    mut process: Command,
+    display: &str,
+    sink: Option<OutputSink>,
+) -> Result<String> {
     let mut child = process
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -127,8 +146,9 @@ pub(crate) fn execute_process(mut process: Command, display: &str) -> Result<Str
         .context("Could not run jj; install jj 0.47 for editing and Git actions")?;
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    let out = thread::spawn(move || collect(stdout));
-    let err = thread::spawn(move || collect(stderr));
+    let err_sink = sink.clone();
+    let out = thread::spawn(move || collect(stdout, sink));
+    let err = thread::spawn(move || collect(stderr, err_sink));
     let start = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -591,6 +611,118 @@ mod tests {
                 .filter_map(|row| row.bookmark.as_ref())
                 .any(|action| action.name == name)
         );
+    }
+
+    #[test]
+    fn bookmark_and_git_menus_match_jjui_items() {
+        let temp = fixture();
+        let root = temp.path();
+        run_spec(root, &CommandSpec::new(["describe", "-m", "base"])).unwrap();
+        run_spec(root, &CommandSpec::new(["bookmark", "create", "main"])).unwrap();
+        run_spec(root, &CommandSpec::new(["new", "-m", "focused change"])).unwrap();
+        let name = "z-topic|special";
+        run_action(root, "set_bookmark", &[current(root).change_id], name, &[]);
+        let focused = current(root).commit_id;
+        let remote = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare", "--quiet"])
+                .arg(remote.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        for name in ["a-remote", "z-remote"] {
+            run_spec(
+                root,
+                &CommandSpec::new([
+                    "git",
+                    "remote",
+                    "add",
+                    name,
+                    remote.path().to_str().unwrap(),
+                ]),
+            )
+            .unwrap();
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let load = |query| {
+            let mut repo = crate::repository::Repository::open(root, 100).unwrap();
+            runtime.block_on(repo.refresh(true)).unwrap();
+            runtime.block_on(repo.listing(query)).unwrap()
+        };
+        // Bookmarks: "local" first, then remotes; kinds in jjui's order; the
+        // main move carries the `m` shortcut; tracking uses the first remote.
+        let bookmarks = load(crate::browser::Query::BookmarkOperations(focused.clone()));
+        assert_eq!(bookmarks.remotes, ["local", "a-remote", "z-remote"]);
+        let actions: Vec<_> = bookmarks
+            .rows
+            .iter()
+            .filter_map(|r| r.bookmark.as_ref())
+            .collect();
+        let kinds: Vec<_> = actions.iter().map(|a| a.kind.as_str()).collect();
+        let mut sorted = kinds.clone();
+        sorted.sort_by_key(|k| crate::bookmarks::kind_priority(k));
+        assert_eq!(kinds, sorted);
+        let main = actions.iter().find(|a| a.kind == "move").unwrap();
+        assert_eq!(
+            (main.name.as_str(), main.key.as_deref()),
+            ("main", Some("m"))
+        );
+        let track = actions
+            .iter()
+            .find(|a| a.kind == "track" && a.name == name)
+            .unwrap();
+        assert!(track.args.contains(&crate::bookmarks::exact("a-remote")));
+
+        // Git: a fixed per-remote menu like jjui's.
+        let git = load(crate::browser::Query::GitOperations(vec![focused.clone()]));
+        assert_eq!(git.remotes, ["a-remote", "z-remote"]);
+        let z: Vec<_> = git
+            .rows
+            .iter()
+            .filter_map(|r| r.bookmark.as_ref())
+            .filter(|a| a.remote.as_deref() == Some("z-remote"))
+            .collect();
+        let keyed = |kind: &str, key: &str| {
+            z.iter()
+                .find(|a| a.kind == kind && a.key.as_deref() == Some(key))
+                .unwrap_or_else(|| panic!("missing {kind} {key}"))
+                .args
+                .clone()
+        };
+        assert_eq!(keyed("push", "p"), ["git", "push", "--remote", "z-remote"]);
+        assert_eq!(
+            keyed("fetch", "f"),
+            ["git", "fetch", "--remote", "z-remote"]
+        );
+        assert_eq!(keyed("fetch", "a"), ["git", "fetch", "--all-remotes"]);
+        let bookmarks_push = keyed("push", "b");
+        assert_eq!(
+            bookmarks_push,
+            [
+                "git",
+                "push",
+                "--remote",
+                "z-remote",
+                "--bookmark",
+                &crate::bookmarks::exact(name)
+            ]
+        );
+        assert!(keyed("push", "c").contains(&"--change".into()));
+        // The bookmark push publishes only that bookmark.
+        run_spec(root, &CommandSpec::new(bookmarks_push)).unwrap();
+        let refs = Command::new("git")
+            .args(["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+            .current_dir(remote.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(refs.stdout).unwrap().trim(), name);
+        // Once pushed, jjui also lists a per-remote bookmark push.
+        let git = load(crate::browser::Query::GitOperations(vec![focused]));
+        assert!(git.rows.iter().any(|r| r.label
+            == format!("git push --bookmark {name} --remote z-remote")
+            && r.bookmark.as_ref().unwrap().remote.as_deref() == Some("a-remote")));
     }
 
     #[test]

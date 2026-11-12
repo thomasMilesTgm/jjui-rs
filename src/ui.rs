@@ -50,6 +50,10 @@ struct App {
     operation_diff: Option<OperationDiff>,
     operation_selection: ListState,
     operation_hit_rows: Vec<(ratatui::layout::Rect, usize)>,
+    bookmark_remote_hits: Vec<(ratatui::layout::Rect, usize)>,
+    /// A command run from the bookmark/Git modal: shown in the modal while it
+    /// runs, and kept there (with a red border) if it fails.
+    command_run: Option<CommandRun>,
     chunk_hit_rows: Vec<(ratatui::layout::Rect, usize, usize)>,
     browse_index: usize,
     bookmark_completion: Option<(String, usize)>,
@@ -99,6 +103,42 @@ enum View {
     Git,
     Text,
     Finder,
+}
+
+#[derive(Debug, Default)]
+struct CommandRun {
+    command: String,
+    output: String,
+    failed: bool,
+}
+
+impl CommandRun {
+    /// Appends streamed output; a bare carriage return (progress updates)
+    /// rewrites the current line.
+    fn push(&mut self, chunk: &str) {
+        for part in chunk.split_inclusive(['\r', '\n']) {
+            if let Some(text) = part.strip_suffix('\r') {
+                let start = self.output.rfind('\n').map_or(0, |i| i + 1);
+                self.output.truncate(start);
+                self.output.push_str(text);
+                self.output.push('\r');
+            } else {
+                if self.output.ends_with('\r') {
+                    let start = self.output.rfind('\n').map_or(0, |i| i + 1);
+                    self.output.truncate(start);
+                }
+                self.output.push_str(part);
+            }
+        }
+        const LIMIT: usize = 256 * 1024;
+        if self.output.len() > LIMIT {
+            let mut cut = self.output.len() - LIMIT;
+            while !self.output.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.output.drain(..cut);
+        }
+    }
 }
 
 struct ChunkEditor {
@@ -743,7 +783,7 @@ impl App {
                         return Effect::None;
                     }
                     "bookmark_filter" => {
-                        self.bookmark_filter = input.text;
+                        self.bookmark_filter = input.text.trim().to_owned();
                         self.browse_index = 0;
                         return Effect::None;
                     }
@@ -794,7 +834,7 @@ impl App {
                     self.search_match(self.search_backwards, true);
                 } else if input.action == "bookmark_filter" {
                     self.bookmark_filter = input.text.clone();
-                    self.browse_index = 0;
+                    self.clamp_browse_index();
                 } else if input.action == "file_filter" {
                     self.file_filter = input.text.clone();
                     self.browse_index = 0;
@@ -840,7 +880,22 @@ impl App {
                 _ => "view",
             }
         };
-        let Some(mut action) = self.binding_action(scope, key) else {
+        let bound = self.binding_action(scope, key);
+        if matches!(self.view, View::Bookmarks | View::Git)
+            && bound.as_deref() != Some("quit")
+            && let Some(run) = &self.command_run
+        {
+            // The modal shows the command's output instead of the menu: wait
+            // while it runs; esc/enter dismisses a failure back to the menu.
+            if run.failed && matches!(bound.as_deref(), Some("cancel" | "bookmark_apply")) {
+                self.command_run = None;
+            }
+            return Effect::None;
+        }
+        if let Some(effect) = self.bookmark_shortcut(key, bound.as_deref()) {
+            return effect;
+        }
+        let Some(mut action) = bound else {
             return Effect::None;
         };
         if action == "expand" {
@@ -949,7 +1004,7 @@ impl App {
                 "bookmark_apply" => return self.apply_bookmark(),
                 "fetch" | "push" if self.view == View::Git => {
                     if self.bookmark_category == action {
-                        return self.apply_bookmark();
+                        return self.apply_bookmark_default();
                     }
                     self.bookmark_category = action.clone();
                     self.browse_index = 0;
@@ -959,15 +1014,7 @@ impl App {
                 | "bookmark_untrack" => {
                     let kind = action.strip_prefix("bookmark_").unwrap();
                     if self.bookmark_category == kind {
-                        if let Some(index) = self.listing_rows().iter().position(|row| {
-                            row.bookmark.as_ref().is_some_and(|action| {
-                                action.kind == "move"
-                                    && matches!(action.name.as_str(), "main" | "master")
-                            })
-                        }) {
-                            self.browse_index = index;
-                        }
-                        return self.apply_bookmark();
+                        return self.apply_bookmark_default();
                     }
                     self.bookmark_category = kind.into();
                     self.browse_index = 0;
@@ -984,7 +1031,7 @@ impl App {
                             })
                             % count;
                     }
-                    self.browse_index = 0;
+                    self.clamp_browse_index();
                     return Effect::None;
                 }
                 "search" => {
@@ -1436,7 +1483,7 @@ impl App {
                 return Effect::None;
             }
             "git" => {
-                let Some(id) = self.selected_id().map(str::to_owned) else {
+                let Some(query) = self.git_query() else {
                     return Effect::None;
                 };
                 self.view = View::Git;
@@ -1448,9 +1495,7 @@ impl App {
                 self.bookmark_filter.clear();
                 self.browse_index = 0;
                 self.busy = true;
-                return Effect::Request(crate::live::Request::Listing(
-                    crate::browser::Query::GitOperations(id),
-                ));
+                return Effect::Request(crate::live::Request::Listing(query));
             }
             "fetch" | "push" => {
                 self.start_input(
@@ -1618,6 +1663,16 @@ impl App {
                     }
                     return;
                 }
+                if self.command_run.is_none()
+                    && let Some((_, index)) = self
+                        .bookmark_remote_hits
+                        .iter()
+                        .find(|(rect, _)| rect.contains((mouse.column, mouse.row).into()))
+                {
+                    self.bookmark_remote = *index;
+                    self.clamp_browse_index();
+                    return;
+                }
                 if let Some((_, index)) = self
                     .operation_hit_rows
                     .iter()
@@ -1714,8 +1769,8 @@ impl App {
                         .is_some_and(|input| input.action == "set_bookmark"))
                     && self.selected_id() == Some(id)
             }
-            crate::browser::Query::GitOperations(id) => {
-                self.view == View::Git && self.selected_id() == Some(id)
+            crate::browser::Query::GitOperations(_) => {
+                self.view == View::Git && self.git_query().as_ref() == Some(query)
             }
             crate::browser::Query::Operations => self.view == View::Operations,
             crate::browser::Query::CommitOperations(id) => {
@@ -1726,6 +1781,161 @@ impl App {
             }
         }
     }
+    /// jjui runs the item carrying a shortcut (moving main/master) when its
+    /// category key is pressed again, falling back to the selected item.
+    /// In the Git menu, repeating `p`/`f` runs the plain push/fetch for the
+    /// selected remote.
+    fn apply_bookmark_default(&mut self) -> Effect {
+        if self.pending_command {
+            return Effect::None;
+        }
+        let remote = self.bookmark_remotes.get(self.bookmark_remote).cloned();
+        let category = self.bookmark_category.clone();
+        let default = self
+            .listing_rows()
+            .iter()
+            .filter_map(|row| row.bookmark.as_ref())
+            .find(|action| {
+                if self.view == View::Git {
+                    remote.as_ref().is_some_and(|remote| {
+                        action.args == ["git", category.as_str(), "--remote", remote.as_str()]
+                    })
+                } else {
+                    action.key.is_some()
+                }
+            })
+            .map(|action| action.args.clone());
+        if let Some(args) = default {
+            return self.run_modal_command(args);
+        }
+        self.apply_bookmark()
+    }
+    /// While a category filter is applied, jjui runs the visible item whose
+    /// shortcut matches an otherwise unbound (or remote-management) key.
+    fn bookmark_shortcut(&mut self, key: KeyEvent, bound: Option<&str>) -> Option<Effect> {
+        if !matches!(self.view, View::Bookmarks | View::Git)
+            || self.bookmark_category.is_empty()
+            || self.pending_command
+            || !matches!(bound, None | Some("remote_add" | "remote_remove"))
+            || key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return None;
+        }
+        let KeyCode::Char(c) = key.code else {
+            return None;
+        };
+        let args = self
+            .listing_rows()
+            .iter()
+            .filter_map(|row| row.bookmark.as_ref())
+            .find(|action| action.key.as_deref() == Some(c.encode_utf8(&mut [0; 4])))?
+            .args
+            .clone();
+        Some(self.run_modal_command(args))
+    }
+    /// jjui's Git menu acts on the marked revisions, or the selected one.
+    fn git_query(&self) -> Option<crate::browser::Query> {
+        let snapshot = self.snapshot.as_ref()?;
+        let ids: Vec<String> = if self.marked.is_empty() {
+            vec![self.selected_id()?.to_owned()]
+        } else {
+            snapshot
+                .revisions
+                .iter()
+                .filter(|r| self.marked.contains(&r.commit_id))
+                .map(|r| r.commit_id.clone())
+                .collect()
+        };
+        Some(crate::browser::Query::GitOperations(ids))
+    }
+    fn command_output(&mut self, chunk: &str) {
+        if let Some(run) = &mut self.command_run
+            && !run.failed
+        {
+            run.push(chunk);
+        }
+    }
+    /// Closes the modal after its command succeeds; on failure keeps it open
+    /// with the error and returns true (the error is shown only there).
+    fn finish_modal_command(&mut self, command: &str, result: &Result<String, String>) -> bool {
+        let modal_run = matches!(self.view, View::Bookmarks | View::Git)
+            && self
+                .command_run
+                .as_ref()
+                .is_some_and(|run| run.command == command);
+        if modal_run && let Err(error) = result {
+            let run = self.command_run.as_mut().unwrap();
+            run.failed = true;
+            run.output = error.clone();
+            return true;
+        }
+        self.command_run = None;
+        if modal_run {
+            self.view = View::Revisions;
+        }
+        false
+    }
+    /// Runs a menu item, showing its output inside the modal.
+    fn run_modal_command(&mut self, args: Vec<String>) -> Effect {
+        let spec = crate::commands::CommandSpec::new(args);
+        self.command_run = Some(CommandRun {
+            command: spec.display(),
+            ..Default::default()
+        });
+        self.command_effect(spec)
+    }
+    fn clamp_browse_index(&mut self) {
+        if self.browse_index >= self.listing_rows().len() {
+            self.browse_index = 0;
+        }
+    }
+    /// jjui orders each action kind by graph distance from the revision the
+    /// menu was opened on: nearest ancestors first, then nearest descendants,
+    /// then bookmarks outside the log, ties broken by label.
+    fn sort_bookmark_rows(&self, current: &str, rows: &mut [crate::browser::Row]) {
+        let order: Vec<&str> = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .revisions
+                    .iter()
+                    .map(|r| r.commit_id.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let position = order.iter().position(|id| *id == current);
+        let distance = |row: &crate::browser::Row| -> i64 {
+            let target = row.bookmark.as_ref().and_then(|a| a.target.as_deref());
+            match (
+                target.and_then(|t| order.iter().position(|id| *id == t)),
+                position,
+            ) {
+                (Some(index), Some(current)) => index as i64 - current as i64,
+                (Some(index), None) => index as i64 + 1,
+                _ => i64::from(i32::MIN),
+            }
+        };
+        rows.sort_by(|a, b| {
+            let kind = |row: &crate::browser::Row| {
+                crate::bookmarks::kind_priority(
+                    row.bookmark.as_ref().map(|a| a.kind.as_str()).unwrap_or(""),
+                )
+            };
+            let (da, db) = (distance(a), distance(b));
+            kind(a).cmp(&kind(b)).then_with(|| {
+                if da == db {
+                    a.label.cmp(&b.label)
+                } else if da >= 0 && db >= 0 {
+                    da.cmp(&db)
+                } else {
+                    db.cmp(&da)
+                }
+            })
+        });
+    }
     fn apply_bookmark(&mut self) -> Effect {
         if self.pending_command {
             return Effect::None;
@@ -1735,7 +1945,7 @@ impl App {
             .get(self.browse_index)
             .and_then(|row| row.bookmark.as_ref())
         {
-            return self.command_effect(crate::commands::CommandSpec::new(action.args.clone()));
+            return self.run_modal_command(action.args.clone());
         }
         Effect::None
     }
@@ -2190,9 +2400,7 @@ pub fn run(
                             || matches!(app.view, View::Operations | View::InlineOperations)
                         {
                             let query = match app.view {
-                                View::Git => app
-                                    .selected_id()
-                                    .map(|id| crate::browser::Query::GitOperations(id.into())),
+                                View::Git => app.git_query(),
                                 View::Bookmarks => app
                                     .selected_id()
                                     .map(|id| crate::browser::Query::BookmarkOperations(id.into())),
@@ -2244,7 +2452,11 @@ pub fn run(
                                         .bookmark_remote
                                         .min(app.bookmark_remotes.len().saturating_sub(1));
                                 }
-                                app.listing = list.rows;
+                                let mut rows = list.rows;
+                                if let crate::browser::Query::BookmarkOperations(id) = &list.query {
+                                    app.sort_bookmark_rows(id, &mut rows);
+                                }
+                                app.listing = rows;
                                 app.browse_index = selected
                                     .and_then(|id| {
                                         app.listing_rows().iter().position(|r| r.id == id)
@@ -2254,12 +2466,17 @@ pub fn run(
                             Err(error) => app.error = Some(error),
                         }
                     }
+                    Update::CommandOutput(chunk) => app.command_output(&chunk),
                     Update::CommandFinished { command, result } => {
                         if command.starts_with("jj workspace ") && app.workspace_menu.is_some() {
                             let _ = live.tasks.try_send(crate::live::Request::Workspaces);
                         }
                         app.busy = false;
                         app.pending_command = false;
+                        if app.finish_modal_command(&command, &result) {
+                            app.requested = None;
+                            continue;
+                        }
                         match result {
                             Ok(output) => {
                                 if command.ends_with("selected hunks") {
@@ -2533,6 +2750,7 @@ fn prompt_lines(app: &App, prefix: &str, width: usize) -> Vec<Line<'static>> {
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     app.hit_rows.clear();
     app.operation_hit_rows.clear();
+    app.bookmark_remote_hits.clear();
     app.chunk_hit_rows.clear();
     let workspace_input = if app.workspace_menu.is_some() {
         app.input.take()
@@ -4087,13 +4305,31 @@ fn short(value: &str) -> &str {
     &value[..value.len().min(12)]
 }
 
+/// Hard-wraps text to `width` display columns.
+fn wrap_lines(text: &str, width: u16) -> Vec<String> {
+    let width = width as usize;
+    let mut lines = Vec::new();
+    for raw in text.lines() {
+        let mut line = String::new();
+        let mut used = 0;
+        for c in raw.chars() {
+            let w = Span::raw(c.to_string()).width();
+            if used + w > width && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            line.push(c);
+            used += w;
+        }
+        lines.push(line);
+    }
+    lines
+}
+
 fn draw_bookmarks(frame: &mut ratatui::Frame, body: ratatui::layout::Rect, app: &mut App) {
-    let width = body.width.saturating_sub(4).min(90).max(body.width.min(4));
-    let height = body
-        .height
-        .saturating_sub(4)
-        .min(24)
-        .max(body.height.min(4));
+    // jjui's menu: at most 80x40, centered.
+    let width = body.width.min(80).saturating_sub(2);
+    let height = body.height.min(40).saturating_sub(2);
     let popup = ratatui::layout::Rect::new(
         body.x + (body.width - width) / 2,
         body.y + (body.height - height) / 2,
@@ -4101,55 +4337,141 @@ fn draw_bookmarks(frame: &mut ratatui::Frame, body: ratatui::layout::Rect, app: 
         height,
     );
     frame.render_widget(ratatui::widgets::Clear, popup);
-    let block = Block::bordered().title(if app.view == View::Git {
+    let mut block = Block::bordered().title(if app.view == View::Git {
         " Git Operations "
     } else {
         " Bookmark Operations "
     });
+    if app.command_run.as_ref().is_some_and(|run| run.failed) {
+        block = block
+            .border_style(Style::default().fg(Color::Red))
+            .title_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+    }
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let [remote_area, filter_area, list_area] = Layout::vertical([
+    let [remote_area, _, filter_area, _, list_area] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Min(1),
     ])
     .areas(inner);
-    let mut remotes = vec![Span::styled(
-        "Remotes: ",
-        Style::default().fg(Color::DarkGray),
-    )];
-    for (index, name) in app.bookmark_remotes.iter().enumerate() {
+    let dim = Style::default().fg(Color::DarkGray);
+    let value = Style::default()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD);
+    let mut remotes = vec![Span::styled(" Remotes: ", value)];
+    let mut x = remote_area.x + Line::from(remotes.clone()).width() as u16;
+    if app.bookmark_remotes.is_empty() {
         remotes.push(Span::styled(
-            format!(" {name} "),
+            "NO REMOTE FOUND",
+            Style::default().fg(Color::Red),
+        ));
+    }
+    for (index, name) in app.bookmark_remotes.iter().enumerate() {
+        let width = Line::raw(name.as_str()).width() as u16;
+        if x < remote_area.right() {
+            app.bookmark_remote_hits.push((
+                ratatui::layout::Rect::new(x, remote_area.y, width.min(remote_area.right() - x), 1),
+                index,
+            ));
+        }
+        x = x.saturating_add(width + 1);
+        remotes.push(Span::styled(
+            name.clone(),
             if index == app.bookmark_remote {
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                dim
             },
         ));
+        remotes.push(Span::raw(" "));
     }
     frame.render_widget(Paragraph::new(Line::from(remotes)), remote_area);
     let filter = if let Some(input) = &app.input
         && input.action != "command"
     {
-        input.visible()
+        Line::raw(input.visible())
+    } else if app.view == View::Git {
+        if app.bookmark_category.is_empty() {
+            Line::from(vec![Span::raw(" Showing "), Span::styled("all", value)])
+        } else {
+            Line::from(vec![
+                Span::raw(" Showing only "),
+                Span::styled(app.bookmark_category.clone(), value),
+            ])
+        }
     } else {
-        format!(
-            "Showing: {}{}",
-            if app.bookmark_category.is_empty() {
-                "all actions"
-            } else {
-                &app.bookmark_category
-            },
-            if app.bookmark_filter.is_empty() {
-                String::new()
-            } else {
-                format!(" · {}", app.bookmark_filter)
-            }
-        )
+        let mut parts = vec![
+            Span::raw(" Showing: "),
+            Span::styled(
+                if app.bookmark_category.is_empty() {
+                    "all actions".to_owned()
+                } else {
+                    app.bookmark_category.clone()
+                },
+                value,
+            ),
+            Span::raw(" for "),
+            Span::styled(
+                app.bookmark_remotes
+                    .get(app.bookmark_remote)
+                    .cloned()
+                    .unwrap_or_else(|| "all remotes".into()),
+                value,
+            ),
+            Span::raw(" remote"),
+        ];
+        if !app.bookmark_filter.is_empty() {
+            parts.extend([
+                Span::raw(" containing "),
+                Span::styled(format!("\"{}\"", app.bookmark_filter), value),
+            ]);
+        }
+        Line::from(parts)
     };
+    if let Some(run) = &app.command_run {
+        let (status, style) = if run.failed {
+            (
+                " Failed (esc to go back)",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (" Running…", Style::default().fg(Color::Yellow))
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(status, style),
+                Span::styled(format!("  {}", run.command), dim),
+            ])),
+            filter_area,
+        );
+        let output = run.output.replace('\r', "");
+        let mut lines = wrap_lines(output.trim_end(), list_area.width.saturating_sub(2).max(1));
+        // Follow the tail of the output.
+        let keep = list_area.height as usize;
+        if lines.len() > keep {
+            lines.drain(..lines.len() - keep);
+        }
+        let text_style = if run.failed {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(
+            Paragraph::new(
+                lines
+                    .into_iter()
+                    .map(|line| Line::styled(format!(" {line}"), text_style))
+                    .collect::<Vec<_>>(),
+            ),
+            list_area,
+        );
+        return;
+    }
     frame.render_widget(Paragraph::new(filter), filter_area);
     let rows = app.listing_rows();
     if rows.is_empty() {
@@ -4168,17 +4490,33 @@ fn draw_bookmarks(frame: &mut ratatui::Frame, body: ratatui::layout::Rect, app: 
         );
         return;
     }
+    let show_keys = !app.bookmark_category.is_empty();
     let items = rows
         .iter()
         .map(|row| {
-            let command = row
-                .bookmark
-                .as_ref()
-                .map(|action| crate::commands::CommandSpec::new(action.args.clone()).display())
+            let action = row.bookmark.as_ref();
+            let description = action
+                .map(|action| {
+                    action
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| action.args.join(" "))
+                })
                 .unwrap_or_default();
+            let mut title = vec![Span::raw(" ")];
+            if show_keys && let Some(key) = action.and_then(|action| action.key.as_deref()) {
+                title.push(Span::styled(
+                    key.to_owned(),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                title.push(Span::raw(" "));
+            }
+            title.push(Span::raw(row.label.clone()));
             ListItem::new(vec![
-                Line::raw(row.label.clone()),
-                Line::styled(command, Style::default().fg(Color::DarkGray)),
+                Line::from(title),
+                Line::styled(format!(" {description}"), dim),
                 Line::raw(""),
             ])
         })
@@ -5217,6 +5555,9 @@ mod tests {
                     name: "origin".into(),
                     remote: Some("origin".into()),
                     local: false,
+                    target: None,
+                    description: None,
+                    key: None,
                     args: vec![
                         "git".into(),
                         kind.into(),
@@ -5237,6 +5578,214 @@ mod tests {
             panic!("expected fetch");
         };
         assert_eq!(spec.args, ["git", "fetch", "--remote", "origin"]);
+    }
+
+    #[test]
+    fn git_menu_category_keys_and_shortcuts_follow_jjui() {
+        let mut app = key_fixture();
+        app.view = View::Git;
+        app.bookmark_remotes = vec!["origin".into()];
+        let row = |kind: &str, key: Option<&str>, args: &[&str]| crate::browser::Row {
+            id: args.join(" "),
+            label: format!("git {}", args.join(" ")),
+            operation: None,
+            bookmark: Some(crate::browser::BookmarkAction {
+                kind: kind.into(),
+                name: "origin".into(),
+                remote: Some("origin".into()),
+                local: false,
+                target: None,
+                description: Some("desc".into()),
+                key: key.map(str::to_owned),
+                args: args.iter().map(|s| s.to_string()).collect(),
+            }),
+        };
+        app.listing = vec![
+            row(
+                "push",
+                None,
+                &["git", "push", "--bookmark", "x", "--remote", "origin"],
+            ),
+            row("push", Some("p"), &["git", "push", "--remote", "origin"]),
+            row(
+                "push",
+                Some("t"),
+                &["git", "push", "--tracked", "--remote", "origin"],
+            ),
+            row("fetch", Some("f"), &["git", "fetch", "--remote", "origin"]),
+            row("fetch", Some("a"), &["git", "fetch", "--all-remotes"]),
+        ];
+        // Without a category, `a` keeps its binding (add remote).
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.input.as_ref().unwrap().action, "remote_add");
+        press(&mut app, KeyCode::Esc);
+        // Repeating `p` runs the plain push even when another row is selected.
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.browse_index, 0);
+        let Effect::Request(crate::live::Request::Command(spec)) =
+            press(&mut app, KeyCode::Char('p'))
+        else {
+            panic!("expected push");
+        };
+        assert_eq!(spec.args, ["git", "push", "--remote", "origin"]);
+        // Simulate the command having finished without closing the menu.
+        app.pending_command = false;
+        app.command_run = None;
+        // Under a category, a shortcut key runs its item.
+        let Effect::Request(crate::live::Request::Command(spec)) =
+            press(&mut app, KeyCode::Char('t'))
+        else {
+            panic!("expected tracked push");
+        };
+        assert_eq!(
+            spec.args,
+            ["git", "push", "--tracked", "--remote", "origin"]
+        );
+        // Simulate the command having finished without closing the menu.
+        app.pending_command = false;
+        app.command_run = None;
+        press(&mut app, KeyCode::Char('f'));
+        let Effect::Request(crate::live::Request::Command(spec)) =
+            press(&mut app, KeyCode::Char('a'))
+        else {
+            panic!("expected fetch --all-remotes");
+        };
+        assert_eq!(spec.args, ["git", "fetch", "--all-remotes"]);
+    }
+
+    #[test]
+    fn bookmark_rows_sort_by_graph_distance_like_jjui() {
+        let app = key_fixture();
+        let ids: Vec<String> = app
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .revisions
+            .iter()
+            .map(|r| r.commit_id.clone())
+            .collect();
+        assert!(ids.len() >= 3, "fixture needs three revisions");
+        let row = |name: &str, target: Option<&String>| crate::browser::Row {
+            id: name.into(),
+            label: format!("delete '{name}'"),
+            operation: None,
+            bookmark: Some(crate::browser::BookmarkAction {
+                kind: "delete".into(),
+                name: name.into(),
+                remote: None,
+                local: true,
+                target: target.cloned(),
+                description: None,
+                key: None,
+                args: vec![],
+            }),
+        };
+        let mut rows = vec![
+            row("a-outside", None),
+            row("b-above", Some(&ids[0])),
+            row("c-below", Some(&ids[2])),
+            row("d-here", Some(&ids[1])),
+        ];
+        app.sort_bookmark_rows(&ids[1], &mut rows);
+        let names: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(names, ["d-here", "c-below", "b-above", "a-outside"]);
+    }
+
+    #[test]
+    fn modal_streams_output_closes_on_success_and_keeps_failures() {
+        let mut app = key_fixture();
+        app.view = View::Git;
+        app.bookmark_remotes = vec!["origin".into()];
+        app.listing = vec![crate::browser::Row {
+            id: "push".into(),
+            label: "git push --remote origin".into(),
+            operation: None,
+            bookmark: Some(crate::browser::BookmarkAction {
+                kind: "push".into(),
+                name: "origin".into(),
+                remote: Some("origin".into()),
+                local: false,
+                target: None,
+                description: Some("Push".into()),
+                key: Some("p".into()),
+                args: vec![
+                    "git".into(),
+                    "push".into(),
+                    "--remote".into(),
+                    "origin".into(),
+                ],
+            }),
+        }];
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            Effect::Request(crate::live::Request::Command(_))
+        ));
+        let command = app.command_run.as_ref().unwrap().command.clone();
+        app.command_output("Pushing to origin\nprogress 1%\rprogress 100%\n");
+        assert_eq!(
+            app.command_run.as_ref().unwrap().output,
+            "Pushing to origin\nprogress 100%\n"
+        );
+        let rows = rendered_rows(&mut app, 40);
+        assert!(rows.iter().any(|r| r.contains("Running")));
+        assert!(rows.iter().any(|r| r.contains("progress 100%")));
+        // Keys don't touch the menu while the command runs.
+        assert_eq!(press(&mut app, KeyCode::Esc), Effect::None);
+        assert_eq!(app.view, View::Git);
+
+        // A refused push keeps the modal open with the error and a red border.
+        app.busy = false;
+        app.pending_command = false;
+        let error = format!("{command} failed (exit status: 1)\n! [remote rejected] main");
+        assert!(app.finish_modal_command(&command, &Err(error)));
+        assert_eq!(app.view, View::Git);
+        assert!(app.error.is_none());
+        let rows = rendered_rows(&mut app, 40);
+        assert!(rows.iter().any(|r| r.contains("remote rejected")));
+        assert!(rows.iter().any(|r| r.contains("Failed")));
+        // Esc returns to the menu, a second esc closes it.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.command_run.is_none());
+        assert_eq!(app.view, View::Git);
+
+        // Success closes the modal.
+        press(&mut app, KeyCode::Enter);
+        let command = app.command_run.as_ref().unwrap().command.clone();
+        assert!(!app.finish_modal_command(&command, &Ok("done".into())));
+        assert_eq!(app.view, View::Revisions);
+        assert!(app.command_run.is_none());
+    }
+
+    #[test]
+    fn repeated_bookmark_action_runs_main_shortcut_like_jjui() {
+        let mut app = key_fixture();
+        app.view = View::Bookmarks;
+        app.bookmark_remotes = vec!["local".into()];
+        app.listing = ["topic", "main"]
+            .into_iter()
+            .map(|name| crate::browser::Row {
+                id: name.into(),
+                label: format!("move {name}"),
+                operation: None,
+                bookmark: Some(crate::browser::BookmarkAction {
+                    kind: "move".into(),
+                    name: name.into(),
+                    remote: None,
+                    local: true,
+                    target: None,
+                    description: None,
+                    key: (name == "main").then(|| "m".into()),
+                    args: vec!["bookmark".into(), "move".into(), name.into()],
+                }),
+            })
+            .collect();
+        press(&mut app, KeyCode::Char('m'));
+        let Effect::Request(crate::live::Request::Command(command)) =
+            press(&mut app, KeyCode::Char('m'))
+        else {
+            panic!("expected main bookmark command");
+        };
+        assert_eq!(command.args, ["bookmark", "move", "main"]);
     }
 
     #[test]
@@ -5271,6 +5820,9 @@ mod tests {
                 name: name.into(),
                 remote: remote.map(str::to_owned),
                 local,
+                target: None,
+                description: None,
+                key: None,
                 args: vec!["bookmark".into(), kind.into(), name.into()],
             }),
         })
@@ -5312,7 +5864,9 @@ mod tests {
             matches!(press(&mut app, KeyCode::Enter), Effect::None),
             "no duplicate mutations"
         );
+        // Simulate the command having finished without closing the menu.
         app.pending_command = false;
+        app.command_run = None;
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.view, View::Bookmarks);
         press(&mut app, KeyCode::Esc);

@@ -198,6 +198,9 @@ fn main() -> Result<()> {
                 live::Update::Listing(result) => {
                     serde_json::json!({"type":"listing","result":result})
                 }
+                live::Update::CommandOutput(chunk) => {
+                    serde_json::json!({"type":"command_output","chunk":chunk})
+                }
                 live::Update::CommandFinished { command, result } => {
                     serde_json::json!({"type":"command","command":command,"result":result})
                 }

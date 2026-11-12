@@ -3,9 +3,14 @@ use crate::browser::{BookmarkAction, Row};
 use anyhow::{Context, Result};
 use jj_lib::{
     backend::CommitId,
+    object_id::ObjectId,
     repo::{ReadonlyRepo, Repo},
 };
+use std::collections::BTreeSet;
 
+/// Mirrors jjui's bookmark menu: move (bookmarks before or after the
+/// revision), delete, track, untrack and forget items. Rows are ordered by
+/// kind here; the UI then orders each kind by graph distance like jjui.
 pub async fn load(repo: &ReadonlyRepo, id: &str) -> Result<(Vec<Row>, Vec<String>)> {
     let destination = CommitId::try_from_hex(id).context("Invalid bookmark destination")?;
     let commit = repo.store().get_commit_async(&destination).await?;
@@ -14,16 +19,19 @@ pub async fn load(repo: &ReadonlyRepo, id: &str) -> Result<(Vec<Row>, Vec<String
         .map(|git| git.remote_names().iter().map(ToString::to_string).collect())
         .unwrap_or_default();
     remotes.sort();
+    // jjui tracks local bookmarks against the first remote after "local".
     let default_remote = remotes.first().cloned().unwrap_or_else(|| "origin".into());
     let mut rows = Vec::new();
-    let mut names = std::collections::BTreeSet::new();
+    let mut names = BTreeSet::new();
     for (name, target) in repo.view().local_bookmarks() {
         let name = name.as_str();
         names.insert(name.to_owned());
         if !target.is_present() {
             continue;
         }
-        if target.as_normal() != Some(&destination) {
+        let local_target = target.as_normal().map(|id| id.hex());
+        let conflict = !target.is_resolved();
+        if conflict || target.as_normal() != Some(&destination) {
             let mut backwards = false;
             let mut related = false;
             for source in target.present_adds() {
@@ -38,14 +46,21 @@ pub async fn load(repo: &ReadonlyRepo, id: &str) -> Result<(Vec<Row>, Vec<String
                 args.push("--allow-backwards".into());
             }
             args.extend(["--".into(), exact(name)]);
-            let qualifier = if backwards { " backwards" } else { "" };
+            let label = if backwards && !conflict {
+                format!("move '{name}' backwards to {change:.8}")
+            } else if conflict {
+                format!("move conflicted '{name}' to {change:.8}")
+            } else {
+                format!("move '{name}' to {change:.8}")
+            };
             if related {
                 rows.push(row(
                     "move",
                     name,
                     None,
                     true,
-                    format!("move '{name}'{qualifier} to {:.8}", change),
+                    local_target.clone(),
+                    label,
                     args,
                 ));
             }
@@ -55,18 +70,22 @@ pub async fn load(repo: &ReadonlyRepo, id: &str) -> Result<(Vec<Row>, Vec<String
             name,
             None,
             true,
+            local_target.clone(),
             format!("delete '{name}'"),
             vec!["bookmark".into(), "delete".into(), "--".into(), exact(name)],
         ));
-        let tracked = repo.view().all_remote_bookmarks().any(|(symbol, remote)| {
-            symbol.name.as_str() == name && symbol.remote.as_str() != "git" && remote.is_tracked()
-        });
-        if !tracked {
+        // Like jjui, only offer tracking a local bookmark that has no remote refs.
+        let has_remote = repo
+            .view()
+            .all_remote_bookmarks()
+            .any(|(symbol, _)| symbol.name.as_str() == name && symbol.remote.as_str() != "git");
+        if !has_remote {
             rows.push(row(
                 "track",
                 name,
                 Some(default_remote.clone()),
                 true,
+                local_target,
                 format!("track '{name}'"),
                 vec![
                     "bookmark".into(),
@@ -100,7 +119,8 @@ pub async fn load(repo: &ReadonlyRepo, id: &str) -> Result<(Vec<Row>, Vec<String
             name,
             Some(remote_name),
             remote.is_tracked(),
-            format!("{kind} '{symbol}'"),
+            local_target(repo, name),
+            format!("{kind} '{name}@{}'", symbol.remote.as_str()),
             vec![
                 "bookmark".into(),
                 kind.into(),
@@ -117,6 +137,7 @@ pub async fn load(repo: &ReadonlyRepo, id: &str) -> Result<(Vec<Row>, Vec<String
             &name,
             None,
             true,
+            local_target(repo, &name),
             format!("forget '{name}'"),
             vec![
                 "bookmark".into(),
@@ -128,16 +149,25 @@ pub async fn load(repo: &ReadonlyRepo, id: &str) -> Result<(Vec<Row>, Vec<String
     }
     rows.sort_by_key(|row| {
         let action = row.bookmark.as_ref().unwrap();
-        let priority = ["move", "delete", "track", "untrack", "forget"]
-            .iter()
-            .position(|kind| *kind == action.kind)
-            .unwrap();
-        (priority, action.name.clone(), action.remote.clone())
+        (kind_priority(&action.kind), row.label.clone())
     });
-    remotes.sort();
-    remotes.dedup();
     remotes.insert(0, "local".into());
     Ok((rows, remotes))
+}
+
+/// jjui's action order: move, delete, track, untrack, forget.
+pub fn kind_priority(kind: &str) -> usize {
+    ["move", "delete", "track", "untrack", "forget"]
+        .iter()
+        .position(|k| *k == kind)
+        .unwrap_or(usize::MAX)
+}
+
+fn local_target(repo: &ReadonlyRepo, name: &str) -> Option<String> {
+    repo.view()
+        .get_local_bookmark(jj_lib::ref_name::RefName::new(name))
+        .as_normal()
+        .map(|id| id.hex())
 }
 
 fn row(
@@ -145,6 +175,7 @@ fn row(
     name: &str,
     remote: Option<String>,
     local: bool,
+    target: Option<String>,
     label: String,
     args: Vec<String>,
 ) -> Row {
@@ -157,11 +188,15 @@ fn row(
             name: name.into(),
             remote,
             local,
+            target,
+            description: None,
+            // jjui's shortcut: repeating `m` moves main/master.
+            key: (kind == "move" && matches!(name, "main" | "master")).then(|| "m".into()),
             args,
         }),
     }
 }
 
-fn exact(value: &str) -> String {
+pub fn exact(value: &str) -> String {
     format!("exact:{}", serde_json::to_string(value).unwrap())
 }

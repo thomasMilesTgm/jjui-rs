@@ -33,6 +33,8 @@ pub enum Update {
         result: Result<String, String>,
     },
     Listing(Result<crate::browser::Listing, String>),
+    /// Output streamed from a running [`Request::Command`].
+    CommandOutput(String),
     CommandFinished {
         command: String,
         result: Result<String, String>,
@@ -247,8 +249,15 @@ pub fn start(
                             .map_err(|e| format!("{e:#}")),
                     ),
                     Request::Command(spec) => {
-                        let result =
-                            crate::commands::execute(&root, &spec).map_err(|e| format!("{e:#}"));
+                        let output = send.clone();
+                        let result = crate::commands::execute_streaming(
+                            &root,
+                            &spec,
+                            std::sync::Arc::new(move |chunk: &str| {
+                                let _ = output.send(Update::CommandOutput(chunk.to_owned()));
+                            }),
+                        )
+                        .map_err(|e| format!("{e:#}"));
                         if spec.args.first().is_some_and(|arg| arg == "workspace")
                             && let Err(error) = repo.reload_workspace()
                         {
